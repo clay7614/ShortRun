@@ -136,3 +136,40 @@ def remove_alias(alias: str) -> None:
             winreg.DeleteKey(k, name)
     except FileNotFoundError:
         return
+
+
+def update_alias(old_alias: str, new_alias: str, new_exe_path: str, overwrite: bool = False) -> AliasEntry:
+    """エイリアス名やパスを更新する。
+    - alias 変更なし: 既存キーの既定値(Path含む)を更新
+    - alias 変更あり: new_alias を作成し old_alias を削除（上書き許可が無ければ既存チェック）
+    戻り値は最終的な AliasEntry。
+    """
+    validate_alias(new_alias)
+    new_exe_path = os.path.abspath(new_exe_path)
+    if not os.path.isfile(new_exe_path):
+        raise FileNotFoundError(f"EXE が見つかりません: {new_exe_path}")
+
+    if old_alias == new_alias:
+        # そのまま更新
+        name = _app_paths_subkey_name(old_alias)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, os.path.join(APP_PATHS_KEY, name)) as sk:
+            winreg.SetValueEx(sk, None, 0, winreg.REG_SZ, new_exe_path)
+            winreg.SetValueEx(sk, "Path", 0, winreg.REG_SZ, os.path.dirname(new_exe_path))
+            winreg.SetValueEx(sk, MARKER_NAME, 0, winreg.REG_SZ, MARKER_VALUE)
+        return AliasEntry(alias=new_alias, exe_path=new_exe_path)
+
+    # alias が変わる場合
+    # 既存 new_alias の有無確認
+    if get_alias(new_alias) is not None and not overwrite:
+        raise FileExistsError("同名のエイリアスが既に存在します。上書きするには overwrite=True を指定してください。")
+
+    # 新規作成
+    new_name = _app_paths_subkey_name(new_alias)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, os.path.join(APP_PATHS_KEY, new_name)) as sk:
+        winreg.SetValueEx(sk, None, 0, winreg.REG_SZ, new_exe_path)
+        winreg.SetValueEx(sk, "Path", 0, winreg.REG_SZ, os.path.dirname(new_exe_path))
+        winreg.SetValueEx(sk, MARKER_NAME, 0, winreg.REG_SZ, MARKER_VALUE)
+
+    # 旧キー削除（ShortRun フラグ確認の上）
+    remove_alias(old_alias)
+    return AliasEntry(alias=new_alias, exe_path=new_exe_path)

@@ -25,7 +25,6 @@ def _config_path() -> str:
 
 _DEFAULTS: Dict[str, Any] = {
     "theme": "system",  # system | light | dark
-    "autostart": False,
     "last_tab": 0,
 }
 
@@ -55,43 +54,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
         pass
 
 
-# --- Autostart management ---
-
-def _startup_dir() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    return os.path.join(base, r"Microsoft\Windows\Start Menu\Programs\Startup")
-
-
-def _startup_link_path() -> str:
-    return os.path.join(_startup_dir(), f"{APP_NAME}.lnk")
-
-
-def is_autostart_enabled() -> bool:
-    return os.path.isfile(_startup_link_path())
-
-
-def set_autostart(enabled: bool) -> None:
-    link = _startup_link_path()
-    if enabled:
-        if win32com is None:
-            raise RuntimeError("pywin32 が必要です (win32com.client)")
-        try:
-            shell = win32com.client.Dispatch("WScript.Shell")  # type: ignore
-            shortcut = shell.CreateShortcut(link)
-            shortcut.TargetPath = sys.executable
-            shortcut.Arguments = "-m shortrun"
-            shortcut.WorkingDirectory = os.path.dirname(os.path.dirname(__file__))
-            shortcut.WindowStyle = 7  # Minimized
-            shortcut.Description = APP_NAME
-            shortcut.Save()
-        except Exception as e:
-            raise RuntimeError(f"スタートアップ登録に失敗: {e}")
-    else:
-        try:
-            if os.path.isfile(link):
-                os.remove(link)
-        except Exception as e:
-            raise RuntimeError(f"スタートアップ解除に失敗: {e}")
+# 自動起動関連はユーザー要望により削除
 
 
 # --- Convenience setters ---
