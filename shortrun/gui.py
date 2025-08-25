@@ -3,7 +3,9 @@ import os
 import re
 import subprocess
 import time
+import threading
 from typing import List, Optional, Callable, Tuple
+import datetime as dt
 
 import flet as ft
 
@@ -26,9 +28,8 @@ _banner_seq = 0
 
 
 def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: float = 2.5):
-    """ページ上部から短時間スライド表示する通知。
-    - error=True の場合は赤系、通常は青系。
-    - duration 秒後に自動で閉じる（最新表示を優先）。
+    """ページ上部から短時間スライド表示する通知（オーバーレイ）。
+    レイアウトを押し下げないためダイアログ下の余白が発生しません。
     """
     global _banner_seq
     _banner_seq += 1
@@ -37,41 +38,53 @@ def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: 
     bgcolor = ft.colors.RED_200 if error else ft.colors.BLUE_200
     icon = ft.icons.ERROR_OUTLINE if error else ft.icons.INFO_OUTLINE
 
-    # 既存のバナーを再利用 or 作成
-    if getattr(page, "banner", None) is None:
-        page.banner = ft.Banner(
+    # オーバーレイ用バナーの生成/取得
+    banner_row = getattr(page, "_sr_banner_wrapper", None)
+    banner_box: Optional[ft.Container] = getattr(page, "_sr_banner", None)
+    created = False
+    if banner_box is None:
+        banner_box = ft.Container(
             bgcolor=bgcolor,
-            leading=ft.Icon(icon),
-            content=ft.Text(message),
-            actions=[
-                ft.TextButton("閉じる", on_click=lambda e, p=page: (setattr(p.banner, "open", False), p.update())),
-            ],
+            padding=ft.padding.symmetric(horizontal=16, vertical=10),
+            border_radius=8,
+            content=ft.Row([ft.Icon(icon, size=18, color=ft.colors.BLACK), ft.Text(message, color=ft.colors.BLACK)], spacing=8),
+            opacity=0,
+            offset=ft.Offset(0, -1),
+            animate_opacity=300,
+            animate_offset=ft.animation.Animation(200, "easeOut"),
         )
+        banner_row = ft.Row([banner_box], alignment=ft.MainAxisAlignment.CENTER)
+        page._sr_banner = banner_box
+        page._sr_banner_wrapper = banner_row
+        page.overlay.append(banner_row)
+        created = True
     else:
-        page.banner.bgcolor = bgcolor
-        page.banner.leading = ft.Icon(icon)
-        page.banner.content = ft.Text(message)
-        page.banner.actions = [
-            ft.TextButton("閉じる", on_click=lambda e, p=page: (setattr(p.banner, "open", False), p.update())),
-        ]
+        banner_box.bgcolor = bgcolor
+        banner_box.content = ft.Row([ft.Icon(icon, size=18, color=ft.colors.BLACK), ft.Text(message, color=ft.colors.BLACK)], spacing=8)
 
-    page.banner.open = True
+    # 初回表示は一度マウントを確定してからアニメーション開始
+    if created:
+        page.update()
+
+    # 表示（スライドイン）
+    banner_box.offset = ft.Offset(0, 0)
+    banner_box.opacity = 1
     page.update()
 
-    # 非同期に自動クローズ（別スレッドで待機してから閉じる）
-    def _auto_close_sync(s: int, d: float):
+    # 自動クローズ（スライドアウト）
+    def _auto_close_sync(s: int, d: float, box: ft.Container):
         try:
             time.sleep(max(0.5, d))
-            if s == _banner_seq and getattr(page, "banner", None) is not None:
-                page.banner.open = False
+            if s == _banner_seq and getattr(page, "_sr_banner", None) is box:
+                box.opacity = 0
+                box.offset = ft.Offset(0, -1)
                 page.update()
         except Exception:
             pass
 
     try:
-        page.run_task(lambda: _auto_close_sync(seq, duration))
+        threading.Thread(target=_auto_close_sync, args=(seq, duration, banner_box), daemon=True).start()
     except Exception:
-        # run_task が使えない環境でも例外は無視（自動閉じは諦める）
         pass
 
 
@@ -86,7 +99,12 @@ def _show_info(page: ft.Page, message: str):
 class AliasTabUI:
     def __init__(self, page: ft.Page):
         self.page = page
+        # 別タブへ変更通知（例えばスキャン結果の再描画）
+        self.on_alias_changed: Optional[Callable[[], None]] = None
         self.alias_list = ft.ListView(expand=True, spacing=4, padding=8)
+        # ソート状態（プログラム一覧）
+        self._sort_key: str = "alias"  # alias|path
+        self._sort_asc: bool = True
         self.add_alias_field = ft.TextField(label="プログラム名", width=220, tooltip="Win+R で起動する短い名前。英数・-・_ を推奨")
         self.add_path_field = ft.TextField(label="実行ファイルパス", expand=True, tooltip="起動したい実行ファイルのパス")
         self.file_picker = ft.FilePicker(on_result=self._on_file_picked)
@@ -96,7 +114,27 @@ class AliasTabUI:
         self.open_file_btn = ft.IconButton(ft.icons.FOLDER_OPEN, tooltip="実行ファイルを選択")
         self.open_file_btn.on_click = self._pick_file
         self.add_btn = ft.ElevatedButton(text="追加", icon=ft.icons.ADD, on_click=self._add_alias, tooltip="入力中のプログラム名と実行ファイルパスでプログラムを登録")
-        self.refresh_btn = ft.IconButton(ft.icons.REFRESH, tooltip="保存したプログラムを再読み込み", on_click=lambda e: self.refresh())
+        self.refresh_btn = ft.ElevatedButton(text="再読み込み", icon=ft.icons.REFRESH, tooltip="保存したプログラムを再読み込み", on_click=lambda e: self.refresh())
+
+        # ヘッダー（列名 + ソート）
+        self.ha_name_btn = ft.TextButton()
+        self.ha_path_btn = ft.TextButton()
+        def _set_sort_alias(key: str):
+            if self._sort_key == key:
+                self._sort_asc = not self._sort_asc
+            else:
+                self._sort_key = key
+                self._sort_asc = True
+            self._render_alias_header()
+            self.refresh()
+        self.ha_name_btn.on_click = lambda e: _set_sort_alias("alias")
+        self.ha_path_btn.on_click = lambda e: _set_sort_alias("path")
+        self._render_alias_header()
+        self.alias_header_row = ft.Row([
+            ft.Container(content=self.ha_name_btn, width=180),
+            ft.Container(content=self.ha_path_btn, expand=True),
+            ft.Container(width=160),  # 操作列のスペース
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
 
         # 旧スケジュール設定 UIは統合のため削除し、行ごとの「スケジュール」ボタンからダイアログを開く
         self.current_alias: Optional[str] = None
@@ -112,6 +150,7 @@ class AliasTabUI:
                     self.refresh_btn,
                 ]),
                 ft.Divider(),
+                self.alias_header_row,
                 self.alias_list,
             ], expand=True, spacing=10),
             padding=ft.padding.only(top=12, left=12, right=12, bottom=8),
@@ -121,7 +160,7 @@ class AliasTabUI:
         return self._view
 
     def prefill(self, exe_path: str, alias_name: Optional[str] = None):
-        """アプリ探索からの呼び出しで入力欄を自動セット"""
+        """アプリ一覧からの呼び出しで入力欄を自動セット"""
         self.add_path_field.value = exe_path
         if alias_name:
             self.add_alias_field.value = alias_name
@@ -137,12 +176,26 @@ class AliasTabUI:
         self._refresh_schedule_toggle()
 
     def refresh(self):
+        # 一旦「読み込み中…」を表示
         self.alias_list.controls.clear()
+        self.alias_list.controls.append(ft.Row([ft.ProgressRing(), ft.Text("読み込み中...")]))
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
         entries = registry.list_aliases()
+        # 再描画
+        self.alias_list.controls.clear()
         if not entries:
             self.alias_list.controls.append(ft.Text("登録されたプログラム名はありません。", color=ft.colors.GREY))
         else:
-            for ent in sorted(entries, key=lambda x: x.alias.lower()):
+            # ソート
+            if self._sort_key == "alias":
+                entries.sort(key=lambda x: (x.alias or "").lower(), reverse=not self._sort_asc)
+            else:
+                entries.sort(key=lambda x: (x.exe_path or "").lower(), reverse=not self._sort_asc)
+            for ent in entries:
                 self.alias_list.controls.append(self._alias_row(ent))
         self.page.update()
 
@@ -155,53 +208,201 @@ class AliasTabUI:
             # スケジュール設定をまとめたダイアログ
             alias = ent.alias
             path = ent.exe_path
-            # コントロール
+
+            # コントロール（共通）
             logon_sw = ft.Switch(label="ログオン時に起動", value=False)
-            daily_tf = ft.TextField(label="毎日 時刻 (HH:MM)", width=140)
-            daily_btn = ft.OutlinedButton("毎日を追加")
-            once_date = ft.TextField(label="1回 日付 (YYYY/MM/DD)", width=180)
-            once_time = ft.TextField(label="1回 時刻 (HH:MM)", width=140)
-            add_once_btn = ft.OutlinedButton("1回を追加")
+            onstart_sw = ft.Switch(label="Windows起動時に起動", value=False)
 
-            def add_daily(e: ft.ControlEvent):
-                try:
-                    scheduler.create_daily_task(alias, path, (daily_tf.value or '').strip())
-                    _show_info(self.page, "「毎日」スケジュールを追加しました")
-                except Exception as ex:
-                    _show_error(self.page, f"追加に失敗: {ex}")
+            # 毎日
+            daily_tf = ft.TextField(label="時刻 (HH:MM)", width=140)
+            # 毎分
+            min_every = ft.TextField(label="間隔(分)", width=140)
+            min_start = ft.TextField(label="開始時刻 HH:MM", width=160)
+            # 毎時
+            hr_every = ft.TextField(label="間隔(時間)", width=160)
+            hr_start = ft.TextField(label="開始時刻 HH:MM", width=160)
+            # 毎週
+            weekly_time = ft.TextField(label="時刻 (HH:MM)", width=160)
+            weekly_interval = ft.TextField(label="間隔(週)", width=120)
+            wd_labels = ["月","火","水","木","金","土","日"]
+            wd_check: list[ft.Checkbox] = [ft.Checkbox(label=l, value=False) for l in wd_labels]
+            # 毎月
+            monthly_time = ft.TextField(label="時刻 (HH:MM)", width=160)
+            monthly_days = ft.TextField(label="日付 (例: 1,15,LAST)", width=240)
+            monthly_months = ft.TextField(label="対象月 (例: 1,2,3) ※任意", width=240, tooltip="JAN〜DEC も可。数値は1〜12")
+            monthly_interval = ft.TextField(label="間隔(月)", width=120)
+            # 1回のみ
+            once_date = ft.TextField(label="日付 (YYYY/MM/DD)", width=180)
+            once_time = ft.TextField(label="時刻 (HH:MM)", width=140)
 
-            def add_once(e: ft.ControlEvent):
-                try:
-                    scheduler.create_once_task(alias, path, (once_date.value or '').strip(), (once_time.value or '').strip())
-                    _show_info(self.page, "「1回のみ」スケジュールを追加しました")
-                except Exception as ex:
-                    _show_error(self.page, f"追加に失敗: {ex}")
+            # 日付ピッカー（必要時に生成して開く: 表示崩れ防止）
+            def _open_dp(target_tf: ft.TextField):
+                def _on_change(ev: ft.ControlEvent):
+                    try:
+                        if ev.control.value:
+                            target_tf.value = ev.control.value.strftime('%Y/%m/%d')
+                        if dp in self.page.overlay:
+                            self.page.overlay.remove(dp)
+                        self.page.update()
+                    except Exception:
+                        pass
+                dp = ft.DatePicker(on_change=_on_change)
+                self.page.overlay.append(dp)
+                def _on_dismiss(_: ft.ControlEvent):
+                    try:
+                        if dp in self.page.overlay:
+                            self.page.overlay.remove(dp)
+                        self.page.update()
+                    except Exception:
+                        pass
+                dp.on_dismiss = _on_dismiss
+                dp.open = True
+                self.page.update()
 
-        def delete_all(e: ft.ControlEvent):
+            once_pick_btn = ft.IconButton(ft.icons.CALENDAR_MONTH, tooltip="カレンダーから選択", on_click=lambda e: _open_dp(once_date))
+
+            # 期間オプション（共通）
+            sd_tf = ft.TextField(label="開始日 YYYY/MM/DD", width=190, tooltip="空欄可")
+            ed_tf = ft.TextField(label="終了日 YYYY/MM/DD", width=190, tooltip="空欄可")
+            et_tf = ft.TextField(label="終了時刻 HH:MM", width=160, tooltip="空欄可")
+            du_tf = ft.TextField(label="期間 HHH:MM", width=160, tooltip="空欄可。例 12:00")
+            sd_pick_btn = ft.IconButton(ft.icons.CALENDAR_TODAY, tooltip="開始日を選択", on_click=lambda e: _open_dp(sd_tf))
+            ed_pick_btn = ft.IconButton(ft.icons.EVENT, tooltip="終了日を選択", on_click=lambda e: _open_dp(ed_tf))
+
+            # デフォルト値（現在日時）
+            now = dt.datetime.now()
+            hhmm_now = now.strftime("%H:%M")
+            ymd_now = now.strftime("%Y/%m/%d")
+            daily_tf.value = hhmm_now
+            min_start.value = hhmm_now
+            hr_start.value = hhmm_now
+            weekly_time.value = hhmm_now
+            monthly_time.value = hhmm_now
+            once_date.value = ymd_now
+            once_time.value = hhmm_now
+            sd_tf.value = ymd_now
+
+            # トグル状態のみ更新
+            def refresh_toggles():
+                tasks = scheduler.list_tasks(alias)
+                logon_sw.value = any(t['SimpleName'].endswith('_LOGON') for t in tasks)
+                onstart_sw.value = any(t['SimpleName'].endswith('_ONSTART') for t in tasks)
+                self.page.update()
+
+            def delete_all(e: ft.ControlEvent):
                 try:
-            scheduler.delete_all_for_alias(alias)
-            self.page.close(dlg)
-            _show_info(self.page, "スケジュールを削除しました")
+                    scheduler.delete_all_for_alias(alias)
+                    self.page.close(dlg)
+                    _show_info(self.page, "スケジュールを削除しました")
                 except Exception as ex:
                     _show_error(self.page, f"削除に失敗: {ex}")
 
-            daily_btn.on_click = add_daily
-            add_once_btn.on_click = add_once
+            # 遅延時間（任意）を分入力（ドロップダウン外に配置）
+            idle_minutes = ft.TextField(label="遅延時間(分)", width=140, tooltip="空欄なら変更しません")
 
-            # 既存一覧（のちほど計算）
-            lines: List[str] = ["読み込み中..."]
+            # 種別選択（ドロップダウン・単一選択）
+            schedule_type_dd = ft.Dropdown(
+                label="スケジュール種別",
+                width=300,
+                options=[
+                    ft.dropdown.Option("DAILY", "毎日"),
+                    ft.dropdown.Option("MIN", "毎分"),
+                    ft.dropdown.Option("HOUR", "毎時"),
+                    ft.dropdown.Option("WEEK", "毎週"),
+                    ft.dropdown.Option("MONTH", "毎月"),
+                    ft.dropdown.Option("ONCE", "1回のみ"),
+                ],
+                value=None,
+                padding=ft.padding.only(bottom=12)
+            )
+
+            # 各セクション（表示は選択に応じて切替）
+            sec_daily = ft.Container(content=ft.Column([ft.Row([daily_tf], spacing=8)], spacing=8), visible=False)
+            sec_min = ft.Container(content=ft.Column([ft.Row([min_every, min_start], spacing=8)], spacing=8), visible=False)
+            sec_hour = ft.Container(content=ft.Column([ft.Row([hr_every, hr_start], spacing=8)], spacing=8), visible=False)
+            sec_week = ft.Container(content=ft.Column([
+                ft.Row([weekly_time, weekly_interval], spacing=8),
+                ft.Row(wd_check, spacing=8),
+            ], spacing=8), visible=False)
+            sec_month = ft.Container(content=ft.Column([
+                ft.Row([monthly_time, monthly_interval], spacing=8),
+                ft.Row([monthly_days, monthly_months], spacing=8),
+            ], spacing=8), visible=False)
+            sec_once = ft.Container(content=ft.Column([
+                ft.Row([once_date, once_pick_btn, once_time], spacing=8),
+            ], spacing=8), visible=False)
+
+            def _update_sections(_: Optional[ft.ControlEvent] = None):
+                typ = schedule_type_dd.value
+                sec_daily.visible = typ == "DAILY"
+                sec_min.visible = typ == "MIN"
+                sec_hour.visible = typ == "HOUR"
+                sec_week.visible = typ == "WEEK"
+                sec_month.visible = typ == "MONTH"
+                sec_once.visible = typ == "ONCE"
+                self.page.update()
+
+            schedule_type_dd.on_change = _update_sections
+
+            # 期間指定（左）
+            window_opts = ft.Container(
+                expand=True,
+                content=ft.Column([
+                    ft.Container(
+                        content=ft.Text("期間指定", color=ft.colors.GREY),
+                        padding=ft.padding.only(bottom=8),
+                    ),
+                    ft.Row([sd_tf, sd_pick_btn, ed_tf, ed_pick_btn], spacing=8),
+                    ft.Row([et_tf, du_tf], spacing=8),
+                ], spacing=8),
+            )
+
+            # 遅延時間（右）
+            idle_opts = ft.Container(
+                    expand=True,
+                content=ft.Row([
+                    ft.Container(
+                        content=ft.Text("遅延時間", color=ft.colors.GREY),
+                        padding=ft.padding.only(bottom=8),
+                    ),
+                    ft.Row([idle_minutes], spacing=8),
+                ], spacing=8),
+            )
+
+            # オプション（任意）全体をまとめる
+            options_group = ft.Container(
+                    content=ft.Column([
+                    ft.Container(
+                        content=ft.Text("オプション（任意）", color=ft.colors.GREY),
+                        padding=ft.padding.only(bottom=8),
+                    ),
+                        ft.Column([window_opts, idle_opts], spacing=16),
+                ], spacing=8),
+            )
 
             content = ft.Container(
-                width=860,
+                width=920,
+                height=620,
                 content=ft.Column([
+                    ft.Text(f"対象: {alias}", color=ft.colors.GREY),
                     logon_sw,
-                    ft.Row([daily_tf, daily_btn]),
-                    ft.Row([once_date, once_time, add_once_btn]),
+                    onstart_sw,
                     ft.Divider(),
-                    ft.Text("現在のスケジュール"),
-                    ft.Column([ft.Text(l) for l in lines], scroll=ft.ScrollMode.AUTO, height=220),
-                ], tight=True, spacing=8),
+                    ft.Text("適用する種類を選択", color=ft.colors.GREY),
+                    schedule_type_dd,
+                    sec_daily,
+                    sec_min,
+                    sec_hour,
+                    sec_week,
+                    sec_month,
+                    sec_once,
+                    ft.Divider(),
+                    options_group,
+                ], tight=True, spacing=8, scroll=ft.ScrollMode.ALWAYS),
             )
+
+            # 初期表示反映
+            _update_sections()
 
             def save_all(e: ft.ControlEvent):
                 errors: List[str] = []
@@ -210,17 +411,95 @@ class AliasTabUI:
                     scheduler.ensure_logon_task(alias, path, bool(logon_sw.value))
                 except Exception as ex:
                     errors.append(f"ログオン時: {ex}")
+                # 起動時
+                try:
+                    scheduler.ensure_onstart_task(alias, path, bool(onstart_sw.value))
+                except Exception as ex:
+                    errors.append(f"起動時: {ex}")
+                typ = schedule_type_dd.value
                 # 毎日
-                hhmm = (daily_tf.value or '').strip()
-                if hhmm:
+                if typ == "DAILY":
+                    hhmm = (daily_tf.value or '').strip()
+                    if not hhmm:
+                        errors.append("毎日: 時刻を入力してください")
+                    else:
+                        try:
+                            scheduler.create_daily_task(
+                                alias, path, hhmm,
+                                sd=(sd_tf.value or '').strip() or None,
+                                ed=(ed_tf.value or '').strip() or None,
+                                et=(et_tf.value or '').strip() or None,
+                                du=(du_tf.value or '').strip() or None,
+                            )
+                        except Exception as ex:
+                            errors.append(f"毎日: {ex}")
+                # 毎分
+                if typ == "MIN":
                     try:
-                        scheduler.create_daily_task(alias, path, hhmm)
+                        every = int((min_every.value or '0').strip())
+                        st = (min_start.value or '').strip()
+                        scheduler.create_minutely_task(
+                            alias, path, every, st,
+                            sd=(sd_tf.value or '').strip() or None,
+                            ed=(ed_tf.value or '').strip() or None,
+                            et=(et_tf.value or '').strip() or None,
+                            du=(du_tf.value or '').strip() or None,
+                        )
                     except Exception as ex:
-                        errors.append(f"毎日: {ex}")
+                        errors.append(f"毎分: {ex}")
+                # 毎時
+                if typ == "HOUR":
+                    try:
+                        every = int((hr_every.value or '0').strip())
+                        st = (hr_start.value or '').strip()
+                        scheduler.create_hourly_task(
+                            alias, path, every, st,
+                            sd=(sd_tf.value or '').strip() or None,
+                            ed=(ed_tf.value or '').strip() or None,
+                            et=(et_tf.value or '').strip() or None,
+                            du=(du_tf.value or '').strip() or None,
+                        )
+                    except Exception as ex:
+                        errors.append(f"毎時: {ex}")
+                # 毎週
+                if typ == "WEEK":
+                    try:
+                        sel_days = [cb.label for cb in wd_check if cb.value]
+                        interval = int((weekly_interval.value or '1').strip() or '1')
+                        jp_to_en = {"月":"MON","火":"TUE","水":"WED","木":"THU","金":"FRI","土":"SAT","日":"SUN"}
+                        days = [jp_to_en.get(d, d) for d in sel_days]
+                        if not days:
+                            raise ValueError("曜日を1つ以上選択してください")
+                        if not (weekly_time.value or '').strip():
+                            raise ValueError("時刻を入力してください")
+                        scheduler.create_weekly_task(
+                            alias, path, weekly_time.value.strip(), days, interval,
+                            sd=(sd_tf.value or '').strip() or None,
+                            ed=(ed_tf.value or '').strip() or None,
+                            et=(et_tf.value or '').strip() or None,
+                            du=(du_tf.value or '').strip() or None,
+                        )
+                    except Exception as ex:
+                        errors.append(f"毎週: {ex}")
+                # 毎月
+                if typ == "MONTH":
+                    try:
+                        d = [x.strip() for x in (monthly_days.value or '').split(',') if x.strip()]
+                        m = [x.strip() for x in (monthly_months.value or '').split(',') if x.strip()] if (monthly_months.value or '').strip() else None
+                        interval = int((monthly_interval.value or '1').strip() or '1')
+                        scheduler.create_monthly_task(
+                            alias, path, monthly_time.value.strip(), d, m, interval,
+                            sd=(sd_tf.value or '').strip() or None,
+                            ed=(ed_tf.value or '').strip() or None,
+                            et=(et_tf.value or '').strip() or None,
+                            du=(du_tf.value or '').strip() or None,
+                        )
+                    except Exception as ex:
+                        errors.append(f"毎月: {ex}")
                 # 1回
-                od = (once_date.value or '').strip()
-                ot = (once_time.value or '').strip()
-                if od or ot:
+                if typ == "ONCE":
+                    od = (once_date.value or '').strip()
+                    ot = (once_time.value or '').strip()
                     if od and ot:
                         try:
                             scheduler.create_once_task(alias, path, od, ot)
@@ -228,19 +507,32 @@ class AliasTabUI:
                             errors.append(f"1回のみ: {ex}")
                     else:
                         errors.append("「1回のみ」は日付と時刻を両方入力してください")
+                # 遅延時間（任意）
+                try:
+                    im_str = (idle_minutes.value or "").strip()
+                    if im_str:
+                        scheduler.create_onidle_task(alias, path, int(im_str))
+                except Exception as ex:
+                    errors.append(f"遅延時間: {ex}")
 
-                # 一覧再描画
-                tasks2 = scheduler.list_tasks(alias)
-                logon_sw.value = any(t['SimpleName'].endswith('_LOGON') for t in tasks2)
-                new_lines = [f"- {t['SimpleName']} | 次回: {t['NextRunTime']} | {t['Schedule']}" for t in tasks2] or ["(なし)"]
-                if isinstance(content.content, ft.Column):
-                    content.content.controls[5] = ft.Column([ft.Text(l) for l in new_lines], scroll=ft.ScrollMode.AUTO, height=220)
-                self.page.update()
+                # トグルのみ更新
+                refresh_toggles()
 
                 if errors:
                     _show_error(self.page, "\n".join(errors))
                 else:
                     _show_info(self.page, "保存しました")
+                    try:
+                        self.page.close(dlg)
+                    except Exception:
+                        pass
+
+            # Enterで保存
+            for tf in [daily_tf, min_every, min_start, hr_every, hr_start, weekly_time, weekly_interval, monthly_time, monthly_days, monthly_months, monthly_interval, once_date, once_time, sd_tf, ed_tf, et_tf, du_tf, idle_minutes]:
+                try:
+                    tf.on_submit = save_all
+                except Exception:
+                    pass
 
             dlg = ft.AlertDialog(
                 modal=True,
@@ -248,22 +540,13 @@ class AliasTabUI:
                 content=content,
                 actions=[
                     ft.TextButton("保存", on_click=save_all),
-                    ft.TextButton("全削除", on_click=delete_all),
                     ft.TextButton("閉じる", on_click=lambda e: self.page.close(dlg)),
                 ],
             )
             self.page.open(dlg)
 
             # 内容を計算して更新（同期）
-            tasks = scheduler.list_tasks(alias)
-            logon_sw.value = any(t['SimpleName'].endswith('_LOGON') for t in tasks)
-            lines = [f"- {t['SimpleName']} | 次回: {t['NextRunTime']} | {t['Schedule']}" for t in tasks] or ["(なし)"]
-            # 最後の Column を置き換え
-            if isinstance(content.content, ft.Column):
-                col_controls = content.content.controls
-                # 0: switch, 1: daily row, 2: once row, 3: divider, 4: title, 5: list
-                col_controls[5] = ft.Column([ft.Text(l) for l in lines], scroll=ft.ScrollMode.AUTO, height=220)
-            self.page.update()
+            refresh_toggles()
 
         return ft.Container(
             content=ft.Row([
@@ -277,6 +560,18 @@ class AliasTabUI:
             padding=6,
         )
 
+    def _render_alias_header(self):
+        def label_for(key: str, jp: str) -> str:
+            if self._sort_key == key:
+                return f"{jp} {'▲' if self._sort_asc else '▼'}"
+            return jp
+        self.ha_name_btn.text = label_for("alias", "プログラム名")
+        self.ha_path_btn.text = label_for("path", "パス")
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
     def _launch(self, path: str):
         try:
             subprocess.Popen([path], close_fds=True)
@@ -288,6 +583,11 @@ class AliasTabUI:
             registry.remove_alias(alias)
             _show_info(self.page, f"削除しました: {alias}")
             self.refresh()
+            if self.on_alias_changed:
+                try:
+                    self.on_alias_changed()
+                except Exception:
+                    pass
         except Exception as ex:
             _show_error(self.page, f"削除に失敗: {ex}")
 
@@ -307,10 +607,13 @@ class AliasTabUI:
             page.overlay.append(fp)
         pick_btn = ft.IconButton(ft.icons.FOLDER_OPEN, tooltip="実行ファイルを選択", on_click=lambda e: fp.pick_files(allow_multiple=False, allowed_extensions=["exe"], dialog_title="実行ファイルを選択"))
 
-        content = ft.Column([
-            ft.Row([alias_tf]),
-            ft.Row([path_tf, pick_btn]),
-        ], spacing=10)
+        content = ft.Container(
+            width=560,
+            content=ft.Column([
+                ft.Row([alias_tf], alignment=ft.MainAxisAlignment.START),
+                ft.Row([path_tf, pick_btn], alignment=ft.MainAxisAlignment.START),
+            ], spacing=10, tight=True),
+        )
 
         def do_save(e: ft.ControlEvent, *, overwrite: bool = False):
             new_alias = (alias_tf.value or "").strip()
@@ -323,6 +626,11 @@ class AliasTabUI:
                 page.close(dlg)
                 _show_info(page, f"更新しました: {entry.alias} → {new_alias}")
                 self.refresh()
+                if self.on_alias_changed:
+                    try:
+                        self.on_alias_changed()
+                    except Exception:
+                        pass
             except FileExistsError:
                 # 上書き確認
                 def confirm_over(_: ft.ControlEvent):
@@ -332,6 +640,11 @@ class AliasTabUI:
                         page.close(dlg)
                         _show_info(page, f"上書きしました: {new_alias}")
                         self.refresh()
+                        if self.on_alias_changed:
+                            try:
+                                self.on_alias_changed()
+                            except Exception:
+                                pass
                     except Exception as ex:
                         _show_error(page, f"上書きに失敗: {ex}")
                 confirm = ft.AlertDialog(
@@ -345,6 +658,10 @@ class AliasTabUI:
                 page.open(confirm)
             except Exception as ex:
                 _show_error(page, f"更新に失敗: {ex}")
+
+        # Enterで保存
+        alias_tf.on_submit = do_save
+        path_tf.on_submit = do_save
 
         dlg = ft.AlertDialog(
             modal=True,
@@ -380,6 +697,11 @@ class AliasTabUI:
             self.add_alias_field.value = ""
             self.add_path_field.value = ""
             self.refresh()
+            if self.on_alias_changed:
+                try:
+                    self.on_alias_changed()
+                except Exception:
+                    pass
         except FileExistsError:
             def do_overwrite(_: ft.ControlEvent):
                 try:
@@ -387,6 +709,11 @@ class AliasTabUI:
                     _show_info(self.page, f"上書きしました: {alias}")
                     self.page.close(dialog)
                     self.refresh()
+                    if self.on_alias_changed:
+                        try:
+                            self.on_alias_changed()
+                        except Exception:
+                            pass
                 except Exception as ex:
                     _show_error(self.page, f"上書きに失敗: {ex}")
             dialog = ft.AlertDialog(
@@ -446,14 +773,73 @@ class ScanTabUI:
         self.on_alias_added = on_alias_added
         self.on_request_prefill = on_request_prefill
         self.items: List[scanner.AppCandidate] = []
-        self.filter_field = ft.TextField(hint_text="アプリ名でフィルタ", expand=True, on_change=lambda e: self._render_list(), tooltip="表示中の候補を部分一致で絞り込み")
-        self.scan_btn = ft.ElevatedButton("再スキャン", icon=ft.icons.SEARCH, on_click=lambda e: self.scan(), tooltip="アプリの候補一覧を再取得")
-        self.bulk_add_btn = ft.ElevatedButton("選択を一括追加", icon=ft.icons.ADD_TASK, on_click=lambda e: self._bulk_add(), tooltip="チェック済みの候補をまとめて登録")
+        self._hidden_paths: set[str] = set()  # 既に登録済みの exe パス（正規化）
+        self._visible_keys: set[str] = set()  # 現在表示中の候補キー（正規化パス）
+        # ソート状態
+        self._sort_key: str = "name"  # name|exe|source
+        self._sort_asc: bool = True
+        self.filter_field = ft.TextField(
+            hint_text="アプリ名でフィルタ（-で除外）",
+            expand=True,
+            on_change=lambda e: self._render_list(),
+            tooltip="スペース区切りで複数語を指定できます。-foo のように先頭に - を付けると除外します。"
+        )
+        self.scan_btn = ft.ElevatedButton("再読み込み", icon=ft.icons.REFRESH, on_click=lambda e: self.scan(), tooltip="アプリの候補一覧を再取得")
+        self.bulk_add_btn = ft.ElevatedButton("選択したプログラムを一括追加", icon=ft.icons.ADD_TASK, on_click=lambda e: self._bulk_add(), tooltip="チェック済みの候補をまとめて登録")
         self.list_view = ft.ListView(expand=True, spacing=4, padding=8)
+
+        # ヘッダー（列名 + ソート）
+        def _btn(label: str, on_click: Callable[[ft.ControlEvent], None], *, width: Optional[int] = None, expand: bool = False) -> ft.Control:
+            b = ft.TextButton(text=label, on_click=on_click)
+            if width is not None:
+                return ft.Container(content=b, width=width)
+            if expand:
+                return ft.Container(content=b, expand=True)
+            return b
+
+        self.h_name_btn = ft.TextButton()
+        self.h_path_btn = ft.TextButton()
+        self.h_source_btn = ft.TextButton()
+        # ダミー幅（チェックボックス列/操作列）
+        left_pad = ft.Container(width=28)
+        right_pad = ft.Container(width=44)
+        self.header_row = ft.Row([
+            left_pad,
+            ft.Container(content=self.h_name_btn, width=240),
+            ft.Container(content=self.h_path_btn, expand=True),
+            ft.Container(content=self.h_source_btn, width=140),
+            right_pad,
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+
+        def _set_sort(key: str):
+            if self._sort_key == key:
+                self._sort_asc = not self._sort_asc
+            else:
+                self._sort_key = key
+                self._sort_asc = True
+            self._render_header()
+            self._render_list()
+
+        self.h_name_btn.on_click = lambda e: _set_sort("name")
+        self.h_path_btn.on_click = lambda e: _set_sort("exe")
+        self.h_source_btn.on_click = lambda e: _set_sort("source")
+
+        # 件数ステータスと選択解除
+        self.status_text = ft.Text("該当: 0 / 選択: 0", color=ft.colors.GREY)
+        self.clear_sel_btn = ft.ElevatedButton(
+            "選択を解除",
+            icon=ft.icons.CANCEL_PRESENTATION,
+            on_click=lambda e: self._clear_selection(),
+            tooltip="チェック済みの選択をすべて解除します",
+        )
+
+        self._render_header()
         self._view = ft.Container(
             content=ft.Column([
-                ft.Row([self.filter_field, self.scan_btn, self.bulk_add_btn]),
+                ft.Row([self.filter_field, self.clear_sel_btn, self.scan_btn, self.bulk_add_btn]),
                 ft.Divider(),
+                ft.Row([self.status_text], alignment=ft.MainAxisAlignment.END),
+                self.header_row,
                 self.list_view,
             ], expand=True),
             padding=ft.padding.only(top=12, left=12, right=12, bottom=8),
@@ -466,23 +852,94 @@ class ScanTabUI:
 
     def scan(self):
         self.list_view.controls.clear()
-        self.list_view.controls.append(ft.Row([ft.ProgressRing(), ft.Text("スキャン中...")]))
+        self.list_view.controls.append(ft.Row([ft.ProgressRing(), ft.Text("読み込み中...")]))
         self.page.update()
         # スキャン（同期）
         items = scanner.scan_all()
         self.items = items
+        # 現在の登録済みパスを収集
+        try:
+            regs = registry.list_aliases()
+            self._hidden_paths = {os.path.normcase(os.path.abspath(e.exe_path)) for e in regs}
+        except Exception:
+            self._hidden_paths = set()
         self._render_list()
 
     def _render_list(self):
         q = (self.filter_field.value or "").strip().lower()
         self.list_view.controls.clear()
-        matched = [i for i in self.items if (q in i.name.lower() or q in os.path.basename(i.exe_path).lower())]
+        def norm(p: str) -> str:
+            try:
+                return os.path.normcase(os.path.abspath(p))
+            except Exception:
+                return p
+
+        # 除外語（-prefix）対応のフィルタ
+        def parse_terms(text: str) -> tuple[list[str], list[str]]:
+            if not text:
+                return [], []
+            parts = [t for t in re.split(r"\s+", text) if t]
+            include = [t for t in parts if not t.startswith("-")]
+            exclude = [t[1:] for t in parts if t.startswith("-") and len(t) > 1]
+            return include, exclude
+
+        include_terms, exclude_terms = parse_terms(q)
+
+        def passes(i: scanner.AppCandidate) -> bool:
+            name = (i.name or "").lower()
+            base = os.path.basename(i.exe_path).lower()
+            src = (i.source or "").lower()
+            hay = [name, base, src]
+            # include は AND（すべて含む）
+            if include_terms and not all(any(t in h for h in hay) for t in include_terms):
+                return False
+            # exclude は OR（いずれか含めば除外）
+            if any(t and (t in name or t in base or t in src) for t in exclude_terms):
+                return False
+            # include 指定が無い場合は全件対象
+            return True
+
+        matched_all = [i for i in self.items if passes(i)]
+        # 既に登録された exe パスは除外
+        matched = [i for i in matched_all if norm(i.exe_path) not in self._hidden_paths]
+        # ソート
+        def key_name(i: scanner.AppCandidate) -> str:
+            return (i.name or "").lower()
+        def key_exe(i: scanner.AppCandidate) -> str:
+            try:
+                return (i.exe_path or "").lower()
+            except Exception:
+                return i.exe_path or ""
+        def key_source(i: scanner.AppCandidate) -> str:
+            return (i.source or "").lower()
+        key_funcs = {"name": key_name, "exe": key_exe, "source": key_source}
+        kf = key_funcs.get(self._sort_key, key_name)
+        matched.sort(key=kf, reverse=not self._sort_asc)
+        # 表示中キーを保存し件数更新
+        try:
+            self._visible_keys = {norm(i.exe_path) for i in matched}
+        except Exception:
+            self._visible_keys = set()
+        self._update_status(len(matched))
         if not matched:
             self.list_view.controls.append(ft.Text("該当なし", color=ft.colors.GREY))
         else:
-            for it in sorted(matched, key=lambda x: x.name.lower()):
+            for it in matched:
                 self.list_view.controls.append(self._row(it))
         self.page.update()
+
+    def _render_header(self):
+        def label_for(key: str, jp: str) -> str:
+            if self._sort_key == key:
+                return f"{jp} {'▲' if self._sort_asc else '▼'}"
+            return jp
+        self.h_name_btn.text = label_for("name", "アプリ名")
+        self.h_path_btn.text = label_for("exe", "パス")
+        self.h_source_btn.text = label_for("source", "ソース")
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     def _row(self, it: scanner.AppCandidate) -> ft.Control:
         def toggle_selected(e: ft.ControlEvent):
@@ -493,44 +950,88 @@ class ScanTabUI:
             else:
                 self._selected.add(key)
                 cb.value = True
+            # 件数のみ更新
+            try:
+                self._update_status(len(self._visible_keys))
+            except Exception:
+                pass
             self.page.update()
 
         def create_alias(_: ft.ControlEvent):
-            # + クリックで即時にエイリアスを登録（既存時は上書き確認）
+            # ダイアログでプログラム名を編集してから登録
             suggested = _slugify(it.name) if it.name else _slugify(os.path.splitext(os.path.basename(it.exe_path))[0])
-            try:
-                registry.add_alias(suggested, it.exe_path, overwrite=False)
-                _show_info(self.page, f"登録しました: {suggested}")
-                if self.on_alias_added:
+            alias_tf = ft.TextField(label="プログラム名", value=suggested, width=320)
+
+            def do_register(e: ft.ControlEvent, *, overwrite: bool = False):
+                name = (alias_tf.value or "").strip()
+                if not name:
+                    _show_error(self.page, "プログラム名を入力してください")
+                    return
+                try:
+                    registry.add_alias(name, it.exe_path, overwrite=overwrite)
+                    self.page.close(dlg)
+                    _show_info(self.page, ("上書きしました: " if overwrite else "登録しました: ") + name)
+                    if self.on_alias_added:
+                        try:
+                            self.on_alias_added()
+                        except Exception:
+                            pass
+                    # 追加した exe は非表示にして再描画
                     try:
-                        self.on_alias_added()
+                        self._hidden_paths.add(os.path.normcase(os.path.abspath(it.exe_path)))
                     except Exception:
                         pass
-            except FileExistsError:
-                # 上書き確認
-                def do_over(_: ft.ControlEvent):
-                    try:
-                        registry.add_alias(suggested, it.exe_path, overwrite=True)
-                        _show_info(self.page, f"上書きしました: {suggested}")
-                        if self.on_alias_added:
+                    self._render_list()
+                except FileExistsError:
+                    # 上書き確認
+                    def confirm_over(_: ft.ControlEvent):
+                        try:
+                            registry.add_alias(name, it.exe_path, overwrite=True)
+                            self.page.close(confirm)
+                            self.page.close(dlg)
+                            _show_info(self.page, f"上書きしました: {name}")
+                            if self.on_alias_added:
+                                try:
+                                    self.on_alias_added()
+                                except Exception:
+                                    pass
                             try:
-                                self.on_alias_added()
+                                self._hidden_paths.add(os.path.normcase(os.path.abspath(it.exe_path)))
                             except Exception:
                                 pass
-                        self.page.close(confirm)
-                    except Exception as ex:
-                        _show_error(self.page, f"上書きに失敗: {ex}")
-                confirm = ft.AlertDialog(
-                    title=ft.Text("既存のプログラム名"),
-                    content=ft.Text(f"{suggested} は既に存在します。上書きしますか？"),
-                    actions=[
-                        ft.TextButton("キャンセル", on_click=lambda _: self.page.close(confirm)),
-                        ft.TextButton("上書き", on_click=do_over),
-                    ],
-                )
-                self.page.open(confirm)
-            except Exception as ex:
-                _show_error(self.page, f"登録に失敗: {ex}")
+                            self._render_list()
+                        except Exception as ex:
+                            _show_error(self.page, f"上書きに失敗: {ex}")
+                    confirm = ft.AlertDialog(
+                        title=ft.Text("既存のプログラム名"),
+                        content=ft.Text(f"{name} は既に存在します。上書きしますか？"),
+                        actions=[
+                            ft.TextButton("キャンセル", on_click=lambda _: self.page.close(confirm)),
+                            ft.TextButton("上書き", on_click=confirm_over),
+                        ],
+                    )
+                    self.page.open(confirm)
+                except Exception as ex:
+                    _show_error(self.page, f"登録に失敗: {ex}")
+
+            # Enterで保存
+            alias_tf.on_submit = do_register
+
+            dlg = ft.AlertDialog(
+                title=ft.Text("アプリを追加"),
+                content=ft.Container(
+                    width=420,
+                    content=ft.Column([
+                        ft.Text(os.path.basename(it.exe_path), color=ft.colors.GREY),
+                        alias_tf,
+                    ], spacing=10, tight=True),
+                ),
+                actions=[
+                    ft.TextButton("キャンセル", on_click=lambda e: self.page.close(dlg)),
+                    ft.TextButton("登録", on_click=do_register),
+                ],
+            )
+            self.page.open(dlg)
 
         cb = ft.Checkbox(value=False, on_change=toggle_selected, tooltip="一括追加の対象として選択/解除")
         return ft.Container(
@@ -539,36 +1040,115 @@ class ScanTabUI:
                 ft.Text(it.name, width=240, weight=ft.FontWeight.BOLD),
                 ft.Text(it.exe_path, expand=True, selectable=True),
                 ft.Text(it.source, width=140, color=ft.colors.GREY),
-                ft.IconButton(ft.icons.ADD, tooltip="このアプリを推奨名で直接追加（既存は確認）", on_click=create_alias),
+                ft.IconButton(ft.icons.ADD, tooltip="このアプリを追加", on_click=create_alias),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             padding=6,
         )
 
     def _bulk_add(self):
-        # 選択されたエントリをまとめて追加
+        # 選択されたエントリをまとめて追加（ダイアログで名前編集）
         targets = [i for i in self.items if os.path.normcase(os.path.abspath(i.exe_path)) in self._selected]
         if not targets:
             _show_info(self.page, "一括追加する項目をチェックしてください")
             return
-        errors: List[Tuple[str, str]] = []
-        added = 0
+
+        # 行ごとの入力欄を生成
+        rows: list[tuple[scanner.AppCandidate, ft.TextField]] = []
         for it in targets:
-            alias = _slugify(it.name) if it.name else _slugify(os.path.splitext(os.path.basename(it.exe_path))[0])
+            suggested = _slugify(it.name) if it.name else _slugify(os.path.splitext(os.path.basename(it.exe_path))[0])
+            tf = ft.TextField(value=suggested, width=300)
+            rows.append((it, tf))
+
+        overwrite_cb = ft.Checkbox(label="既存のプログラム名は上書きする", value=False)
+
+        items_column = ft.Column([
+            ft.Row([ft.Text(os.path.basename(it.exe_path), width=280), tf], spacing=12)
+            for (it, tf) in rows
+        ], spacing=8)
+
+        content = ft.Container(
+            width=700,
+            height=480,
+            content=ft.Column([
+                ft.Text("一括追加: プログラム名を確認・編集してから登録します", color=ft.colors.GREY),
+                ft.Container(content=items_column, expand=True, bgcolor=ft.colors.with_opacity(0.02, ft.colors.BLACK), padding=8),
+                overwrite_cb,
+            ], spacing=10, tight=True, scroll=ft.ScrollMode.ALWAYS),
+        )
+
+        def do_register(_: ft.ControlEvent):
+            added = 0
+            errors: List[Tuple[str, str]] = []
+            for it, tf in rows:
+                name = (tf.value or "").strip()
+                if not name:
+                    errors.append((os.path.basename(it.exe_path), "プログラム名が未入力"))
+                    continue
+                try:
+                    registry.add_alias(name, it.exe_path, overwrite=bool(overwrite_cb.value))
+                    added += 1
+                    try:
+                        self._hidden_paths.add(os.path.normcase(os.path.abspath(it.exe_path)))
+                    except Exception:
+                        pass
+                except Exception as ex:
+                    errors.append((name, str(ex)))
+
+            self.page.close(dlg)
+            msg = f"追加: {added}"
+            if errors:
+                msg += f" / 失敗: {len(errors)}"
+            _show_info(self.page, msg)
+
+            # 再描画＆選択解除
+            self._selected.clear()
+            self._render_list()
+            if self.on_alias_added:
+                try:
+                    self.on_alias_added()
+                except Exception:
+                    pass
+
+        # Enterで保存（最後のテキストフィールドに送る）
+        try:
+            rows[-1][1].on_submit = do_register
+        except Exception:
+            pass
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("アプリを一括追加"),
+            content=content,
+            actions=[
+                ft.TextButton("キャンセル", on_click=lambda e: self.page.close(dlg)),
+                ft.TextButton("追加", on_click=do_register),
+            ],
+        )
+        self.page.open(dlg)
+
+    def _update_status(self, matched_count: int):
+        try:
+            selected_in_view = sum(1 for k in self._selected if k in self._visible_keys)
+            self.status_text.value = f"該当: {matched_count} / 選択: {selected_in_view}"
+        except Exception:
+            self.status_text.value = f"該当: {matched_count} / 選択: 0"
+        try:
+            self.page.update()
+        except Exception:
+            pass
+
+    def _clear_selection(self):
+        # 全選択解除して再描画
+        try:
+            self._selected.clear()
+        except Exception:
+            self._selected = set()
+        try:
+            self._render_list()
+        except Exception:
+            # 少なくとも件数だけは更新
             try:
-                registry.add_alias(alias, it.exe_path, overwrite=False)
-                added += 1
-            except FileExistsError:
-                # 既存はスキップ（必要なら上書きオプションを追加可能）
-                continue
-            except Exception as ex:
-                errors.append((alias, str(ex)))
-        msg = f"追加: {added}"
-        if errors:
-            msg += f" / 失敗: {len(errors)}"
-        _show_info(self.page, msg)
-        if self.on_alias_added:
-            try:
-                self.on_alias_added()
+                self._update_status(len(getattr(self, "_visible_keys", set())))
             except Exception:
                 pass
 
@@ -595,7 +1175,7 @@ class SettingsTabUI:
                 self.theme_dropdown,
                 ft.Divider(),
                 ft.Text("その他"),
-                ft.Text("・エイリアスのエクスポート/インポート（今後対応予定）", color=ft.colors.GREY),
+                ft.Text("対応予定の機能はありません．", color=ft.colors.GREY),
             ], expand=False, spacing=12),
             padding=ft.padding.only(top=12, left=12, right=12, bottom=8),
         )
@@ -618,6 +1198,74 @@ class SettingsTabUI:
     # 自動起動設定は削除済み
 
 
+class ScheduleTabUI:
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.alias_filter = ft.TextField(hint_text="プログラム名でフィルタ", width=240, on_change=lambda e: self.refresh())
+        self.refresh_btn = ft.IconButton(ft.icons.REFRESH, tooltip="再読み込み", on_click=lambda e: self.refresh())
+        self.list_view = ft.ListView(expand=True, spacing=4, padding=8)
+        self._refreshing = False
+        self._last_refresh_ts = 0.0
+        self._view = ft.Container(
+            content=ft.Column([
+                ft.Row([self.alias_filter, self.refresh_btn]),
+                ft.Divider(),
+                self.list_view,
+            ], expand=True),
+            padding=ft.padding.only(top=12, left=12, right=12, bottom=8),
+        )
+
+    def view(self) -> ft.Control:
+        return self._view
+
+    def refresh(self):
+        # 短時間の連続呼び出しを抑止（簡易デバウンス）
+        now = time.time()
+        if self._refreshing or (now - self._last_refresh_ts) < 0.3:
+            return
+        self._refreshing = True
+        self._last_refresh_ts = now
+        q = (self.alias_filter.value or "").strip().lower()
+        # 一旦「読み込み中…」を表示
+        self.list_view.controls.clear()
+        self.list_view.controls.append(ft.Row([ft.ProgressRing(), ft.Text("読み込み中...")]))
+        try:
+            self.page.update()
+        except Exception:
+            pass
+        # 取得と再描画
+        self.list_view.controls.clear()
+        tasks = scheduler.list_tasks()
+        if q:
+            tasks = [t for t in tasks if q in t['SimpleName'].lower()]
+        if not tasks:
+            self.list_view.controls.append(ft.Text("タスクはありません", color=ft.colors.GREY))
+        else:
+            for t in tasks:
+                name = t['SimpleName']
+                when = t.get('NextRunTime', '')
+                sched = t.get('Schedule', '')
+                def make_row(simple_name=name, when_text=when, sched_text=sched):
+                    def do_delete(_: ft.ControlEvent):
+                        try:
+                            scheduler.delete_task_by_simple_name(simple_name)
+                            _show_info(self.page, f"削除しました: {simple_name}")
+                            self.refresh()
+                        except Exception as ex:
+                            _show_error(self.page, f"削除に失敗: {ex}")
+                    return ft.Container(
+                        content=ft.Row([
+                            ft.Text(simple_name, expand=True),
+                            ft.Text(when_text, width=200),
+                            ft.Text(sched_text, width=160, color=ft.colors.GREY),
+                            ft.IconButton(ft.icons.DELETE, tooltip="このタスクを削除", on_click=do_delete),
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        padding=6,
+                    )
+                self.list_view.controls.append(make_row())
+        self.page.update()
+        self._refreshing = False
+
 def main(page: ft.Page):
     page.title = "ShortRun"
     page.window_width = 980
@@ -635,13 +1283,27 @@ def main(page: ft.Page):
 
     alias_ui = AliasTabUI(page)
     scan_ui = ScanTabUI(page, on_alias_added=alias_ui.refresh)
+    # 双方向の通知: エイリアス変更時に探索を再描画
+    alias_ui.on_alias_changed = scan_ui.scan
     settings_ui = SettingsTabUI(page, cfg)
+    schedule_tab = ScheduleTabUI(page)
 
     def on_tab_changed(e: ft.ControlEvent):
-        # プログラム名タブに切り替えたら最新化
+        # タブ順: 0:アプリ一覧, 1:スケジュール一覧, 2:プログラム, 3:設定
         if e.control.selected_index == 1:
+            # スケジュール一覧に切替時のみリフレッシュ
+            try:
+                schedule_tab.refresh()
+            except Exception:
+                pass
+        if e.control.selected_index == 2:
+            # プログラムタブに切替時のみ、エイリアスと探索を更新
             try:
                 alias_ui.refresh()
+            except Exception:
+                pass
+            try:
+                scan_ui.scan()
             except Exception:
                 pass
         # タブ位置を保存
@@ -649,10 +1311,12 @@ def main(page: ft.Page):
 
     tabs = ft.Tabs(
         expand=True,
-        selected_index=int(cfg.get("last_tab", 0)),
+        selected_index=0,
+        animation_duration=450,
         tabs=[
-            ft.Tab(text="アプリ探索", content=scan_ui.view()),
-            ft.Tab(text="プログラム名", content=alias_ui.view()),
+            ft.Tab(text="アプリ一覧", content=scan_ui.view()),
+            ft.Tab(text="スケジュール一覧", content=schedule_tab.view()),
+            ft.Tab(text="プログラム", content=alias_ui.view()),
             ft.Tab(text="設定", content=settings_ui.view()),
         ],
         on_change=on_tab_changed,
@@ -661,7 +1325,8 @@ def main(page: ft.Page):
     # + 押下でプレフィル＆タブ遷移するコールバックを接続
     def go_to_alias(exe_path: str, alias_name: str):
         alias_ui.prefill(exe_path, alias_name)
-        tabs.selected_index = 1
+        # プログラムタブへ遷移（タブ順: 0:アプリ一覧, 1:スケジュール一覧, 2:プログラム, 3:設定）
+        tabs.selected_index = 2
         page.update()
 
     scan_ui.on_request_prefill = go_to_alias
