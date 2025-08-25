@@ -6,6 +6,9 @@ import json
 import winreg
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
+import subprocess
+import base64
+import json
 
 try:
     # pywin32
@@ -32,6 +35,24 @@ class AppCandidate:
     name: str
     exe_path: str
     source: str  # uninstall64/uninstall32/startmenu_system/startmenu_user
+
+
+def _run_no_window(args: List[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run subprocess without showing a console window on Windows.
+    Returns CompletedProcess. Adds startupinfo/creationflags when os.name == 'nt'.
+    """
+    if os.name == 'nt':
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
+            si.wShowWindow = 0  # SW_HIDE
+        except Exception:
+            si = None  # type: ignore
+        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        kwargs.setdefault('startupinfo', si)
+        kwargs.setdefault('creationflags', creationflags)
+        kwargs.setdefault('shell', False)
+    return subprocess.run(args, **kwargs)
 
 
 def _iter_registry_keys(root, subkey, access) -> Iterable[Tuple[str, str]]:
@@ -121,23 +142,99 @@ def _iter_shortcuts(root_dir: str) -> Iterable[str]:
 
 
 def _resolve_lnk_target(path: str) -> Optional[str]:
-    if win32com is None:
-        return None
+    # First try via pywin32
+    if win32com is not None:
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")  # type: ignore
+            shortcut = shell.CreateShortCut(path)
+            target = shortcut.TargetPath
+            if target and target.lower().endswith(".exe") and os.path.isfile(target):
+                return target
+        except Exception:
+            pass
+    # Fallback: use PowerShell to read shortcut target to support packaged envs
     try:
-        shell = win32com.client.Dispatch("WScript.Shell")  # type: ignore
-        shortcut = shell.CreateShortCut(path)
-        target = shortcut.TargetPath
-        if target and target.lower().endswith(".exe") and os.path.isfile(target):
+        # Force Unicode (UTF-16LE) output to avoid codepage issues
+        cmd = (
+            "[Console]::OutputEncoding=[System.Text.Encoding]::Unicode; "
+            "(New-Object -ComObject WScript.Shell).CreateShortcut('" + path.replace("'", "''") + "').TargetPath"
+        )
+        ps = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            cmd,
+        ]
+        cp = _run_no_window(ps, capture_output=True, timeout=10)
+        out_bytes = cp.stdout or b""
+        # Decode as UTF-16LE (Unicode)
+        target = (out_bytes.decode('utf-16le', errors='ignore') if out_bytes else '').strip().strip('"')
+        if target and target.lower().endswith('.exe') and os.path.isfile(target):
             return target
     except Exception:
-        return None
+        pass
     return None
+
+
+def _resolve_shortcuts_in_dir(root_dir: str) -> Dict[str, str]:
+    """Resolve all .lnk targets under a directory using a single PowerShell process.
+    Returns mapping: lnk_path -> target_exe (only valid .exe existing on disk).
+    """
+    if not root_dir or not os.path.isdir(root_dir):
+        return {}
+    # Build a PowerShell script and pass via -EncodedCommand (UTF-16LE base64)
+    dir_escaped = root_dir.replace("'", "''")
+    script = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        + "$dir = '{0}'; ".format(dir_escaped)
+        + "Get-ChildItem -LiteralPath $dir -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | "
+        + "ForEach-Object { try { $s = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName); "
+        + "$t = $s.TargetPath; if ($t -and $t.ToLower().EndsWith('.exe') -and (Test-Path -LiteralPath $t)) { "
+        + "[PSCustomObject]@{ Lnk=$_.FullName; Target=$t } } } catch { } } | ConvertTo-Json -Compress"
+    )
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    args = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encoded,
+    ]
+    try:
+        res = _run_no_window(args, capture_output=True, timeout=15)
+        data = res.stdout.decode('utf-8', errors='ignore').strip()
+        if not data:
+            return {}
+        # ConvertTo-Json returns array or single object; normalize to list
+        obj = json.loads(data)
+        items = obj if isinstance(obj, list) else [obj]
+        out: Dict[str, str] = {}
+        for it in items:
+            try:
+                lnk = it.get('Lnk')
+                tgt = it.get('Target')
+                if lnk and tgt and tgt.lower().endswith('.exe') and os.path.isfile(tgt):
+                    out[lnk] = tgt
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
 
 
 def scan_start_menu() -> List[AppCandidate]:
     results: List[AppCandidate] = []
     for i, d in enumerate(START_MENU_DIRS):
         src = "startmenu_system" if i == 0 else "startmenu_user"
+        # Prefer batch resolution for performance in packaged envs
+        mapping = _resolve_shortcuts_in_dir(d)
+        if mapping:
+            for lnk, exe in mapping.items():
+                name = os.path.splitext(os.path.basename(lnk))[0]
+                results.append(AppCandidate(name=name, exe_path=exe, source=src))
+            continue
+        # Fallback to per-link resolution
         for lnk in _iter_shortcuts(d) or []:
             exe = _resolve_lnk_target(lnk)
             if exe:

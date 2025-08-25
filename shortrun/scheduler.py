@@ -29,7 +29,19 @@ def _quote(path: str) -> str:
 
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    """サブプロセス実行（Windowsではコンソールを出さない）。"""
+    kwargs = dict(capture_output=True, text=True, shell=False)
+    if os.name == 'nt':
+        # コンソールの点滅防止
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
+            si.wShowWindow = 0  # SW_HIDE
+        except Exception:
+            si = None
+        creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        kwargs.update(startupinfo=si, creationflags=creationflags)
+    return subprocess.run(cmd, **kwargs)
 
 
 def _append_schedule_window(cmd: List[str], *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None) -> None:

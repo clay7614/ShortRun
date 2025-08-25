@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+	<!-- Background rounded square -->
+	<defs>
+		<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+			<stop offset="0%" stop-color="#1f6feb"/>
+			<stop offset="100%" stop-color="#2ea043"/>
+		</linearGradient>
+		<filter id="s" x="-10%" y="-10%" width="120%" height="120%">
+			<feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.18"/>
+		</filter>
+	</defs>
+
+	<rect x="8" y="8" width="112" height="112" rx="20" fill="url(#g)" filter="url(#s)"/>
+
+	<!-- Rocket symbol to imply fast launch -->
+	<g transform="translate(64,64) rotate(-20)">
+		<path d="M0,-30 C10,-28 20,-18 24,0 C14,-2 6,2 0,8 C-6,2 -14,-2 -24,0 C-20,-18 -10,-28 0,-30 Z"
+					fill="#ffffff" opacity="0.95"/>
+		<!-- window -->
+		<circle cx="6" cy="-16" r="4.2" fill="#1f6feb" opacity="0.9"/>
+		<!-- flame -->
+		<path d="M0,10 C6,16 8,24 0,26 C-8,24 -6,16 0,10 Z" fill="#ffb321"/>
+	</g>
+
+	<!-- Play triangle to convey 'Run' -->
+	<polygon points="90,64 68,77 68,51" fill="#ffffff" opacity="0.92"/>
+
+	<!-- subtle bolt to echo speed -->
+	<path d="M36,38 L50,38 L42,54 L58,54 L36,84 L44,62 L28,62 Z" fill="#ffffff" opacity="0.22"/>
+</svg>

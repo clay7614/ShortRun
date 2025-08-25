@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import re
 import subprocess
 import time
@@ -8,6 +9,29 @@ from typing import List, Optional, Callable, Tuple
 import datetime as dt
 
 import flet as ft
+
+# --- Flet compatibility shims for PyInstaller/runtime ---
+# 一部の環境で ft.icons や ft.colors がエクスポートされない場合があるため補完する
+def _ensure_ft_attr(attr: str, candidates: list[tuple[str, str]]):
+    if hasattr(ft, attr):
+        return
+    mod = None
+    for pkg, name in candidates:
+        try:
+            mod = __import__(pkg, fromlist=[name])
+            obj = getattr(mod, name)
+            setattr(ft, attr, obj)
+            return
+        except Exception:
+            continue
+    # 最後の手段: ダミーを挿す（文字列名をそのまま返す）
+    class _Dummy:
+        def __getattr__(self, n):
+            return n.lower()
+    setattr(ft, attr, _Dummy())
+
+_ensure_ft_attr('icons', [('flet', 'icons'), ('flet_core', 'icons')])
+_ensure_ft_attr('colors', [('flet', 'colors'), ('flet_core', 'colors')])
 
 from . import registry
 from . import scanner
@@ -26,6 +50,42 @@ def _slugify(name: str) -> str:
 
 _banner_seq = 0
 
+# --- Assets path helper ------------------------------------------------------
+def _asset_path(name: str) -> str:
+    """Return absolute path to asset, compatible with PyInstaller."""
+    try:
+        base = getattr(sys, "_MEIPASS", None) or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        return os.path.join(base, "assets", name)
+    except Exception:
+        return os.path.join("assets", name)
+
+def _assets_dir() -> str:
+    """Return absolute path to assets directory for ft.app(assets_dir=...)."""
+    try:
+        base = getattr(sys, "_MEIPASS", None) or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        d = os.path.join(base, "assets")
+        return d
+    except Exception:
+        return os.path.abspath("assets")
+
+
+def _post_ui(page: ft.Page, fn: Callable[[], None]):
+    """UIスレッドに処理をディスパッチするヘルパ。
+    PyInstaller 環境ではバックグラウンドスレッドからの page.update() が無視されることがあるため、
+    必ずこの関数経由で UI 変更 + update を行う。
+    """
+    try:
+        poster = getattr(page, "_sr_post_ui", None)
+        if callable(poster):
+            poster(fn)
+        else:
+            fn()
+    except Exception:
+        try:
+            fn()
+        except Exception:
+            pass
+
 
 def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: float = 2.5):
     """ページ上部から短時間スライド表示する通知（オーバーレイ）。
@@ -35,8 +95,9 @@ def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: 
     _banner_seq += 1
     seq = _banner_seq
 
-    bgcolor = ft.colors.RED_200 if error else ft.colors.BLUE_200
-    icon = ft.icons.ERROR_OUTLINE if error else ft.icons.INFO_OUTLINE
+    # flet の icons/colors が PyInstaller で見つからない環境でも確実に表示する
+    bgcolor = "#EF9A9A" if error else "#90CAF9"  # red200 / blue200
+    icon = "error_outline" if error else "info_outline"
 
     # オーバーレイ用バナーの生成/取得
     banner_row = getattr(page, "_sr_banner_wrapper", None)
@@ -47,11 +108,10 @@ def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: 
             bgcolor=bgcolor,
             padding=ft.padding.symmetric(horizontal=16, vertical=10),
             border_radius=8,
-            content=ft.Row([ft.Icon(icon, size=18, color=ft.colors.BLACK), ft.Text(message, color=ft.colors.BLACK)], spacing=8),
+            content=ft.Row([ft.Icon(icon, size=18, color="#000000"), ft.Text(message, color="#000000")], spacing=8),
             opacity=0,
             offset=ft.Offset(0, -1),
             animate_opacity=300,
-            animate_offset=ft.animation.Animation(200, "easeOut"),
         )
         banner_row = ft.Row([banner_box], alignment=ft.MainAxisAlignment.CENTER)
         page._sr_banner = banner_box
@@ -60,25 +120,29 @@ def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: 
         created = True
     else:
         banner_box.bgcolor = bgcolor
-        banner_box.content = ft.Row([ft.Icon(icon, size=18, color=ft.colors.BLACK), ft.Text(message, color=ft.colors.BLACK)], spacing=8)
+        banner_box.content = ft.Row([ft.Icon(icon, size=18, color="#000000"), ft.Text(message, color="#000000")], spacing=8)
 
     # 初回表示は一度マウントを確定してからアニメーション開始
     if created:
-        page.update()
+        _post_ui(page, lambda: page.update())
 
     # 表示（スライドイン）
-    banner_box.offset = ft.Offset(0, 0)
-    banner_box.opacity = 1
-    page.update()
+    def _apply_show():
+        banner_box.offset = ft.Offset(0, 0)
+        banner_box.opacity = 1
+        page.update()
+    _post_ui(page, _apply_show)
 
     # 自動クローズ（スライドアウト）
     def _auto_close_sync(s: int, d: float, box: ft.Container):
         try:
             time.sleep(max(0.5, d))
-            if s == _banner_seq and getattr(page, "_sr_banner", None) is box:
-                box.opacity = 0
-                box.offset = ft.Offset(0, -1)
-                page.update()
+            def _apply_close():
+                if s == _banner_seq and getattr(page, "_sr_banner", None) is box:
+                    box.opacity = 0
+                    box.offset = ft.Offset(0, -1)
+                    page.update()
+            _post_ui(page, _apply_close)
         except Exception:
             pass
 
@@ -208,10 +272,11 @@ class AliasTabUI:
             # スケジュール設定をまとめたダイアログ
             alias = ent.alias
             path = ent.exe_path
+            # open schedule dialog
 
             # コントロール（共通）
-            logon_sw = ft.Switch(label="ログオン時に起動", value=False)
-            onstart_sw = ft.Switch(label="Windows起動時に起動", value=False)
+            logon_sw = ft.Switch(label="ログオン時に起動", value=False, disabled=True)
+            onstart_sw = ft.Switch(label="Windows起動時に起動", value=False, disabled=True)
 
             # 毎日
             daily_tf = ft.TextField(label="時刻 (HH:MM)", width=140)
@@ -315,6 +380,7 @@ class AliasTabUI:
                 value=None,
                 padding=ft.padding.only(bottom=12)
             )
+            schedule_type_dd.disabled = True
 
             # 各セクション（表示は選択に応じて切替）
             sec_daily = ft.Container(content=ft.Column([ft.Row([daily_tf], spacing=8)], spacing=8), visible=False)
@@ -343,6 +409,10 @@ class AliasTabUI:
                 self.page.update()
 
             schedule_type_dd.on_change = _update_sections
+
+            # ローディング表示（初期は見せる）
+            loading_row = ft.Row([ft.ProgressRing(), ft.Text("読み込み中...")], spacing=8)
+            loading_box = ft.Container(content=loading_row, visible=True, padding=ft.padding.only(top=8,left=8))
 
             # 期間指定（左）
             window_opts = ft.Container(
@@ -384,6 +454,7 @@ class AliasTabUI:
                 width=920,
                 height=620,
                 content=ft.Column([
+                    loading_box,
                     ft.Text(f"対象: {alias}", color=ft.colors.GREY),
                     logon_sw,
                     onstart_sw,
@@ -534,19 +605,39 @@ class AliasTabUI:
                 except Exception:
                     pass
 
+            # 保存ボタンは読み込み完了まで無効化
+            save_btn = ft.TextButton("保存", on_click=save_all, disabled=True)
+
             dlg = ft.AlertDialog(
                 modal=True,
                 title=ft.Text(f"スケジュール設定: {alias}"),
                 content=content,
                 actions=[
-                    ft.TextButton("保存", on_click=save_all),
+                    save_btn,
                     ft.TextButton("閉じる", on_click=lambda e: self.page.close(dlg)),
                 ],
             )
             self.page.open(dlg)
 
-            # 内容を計算して更新（同期）
-            refresh_toggles()
+            # 非同期でトグル状態を取得し、完了後にUIを有効化
+            def _fetch_toggles():
+                try:
+                    tasks = scheduler.list_tasks(alias)
+                except Exception:
+                    tasks = []
+                def _apply_after():
+                    try:
+                        logon_sw.value = any(t['SimpleName'].endswith('_LOGON') for t in tasks)
+                        onstart_sw.value = any(t['SimpleName'].endswith('_ONSTART') for t in tasks)
+                        logon_sw.disabled = False
+                        onstart_sw.disabled = False
+                        schedule_type_dd.disabled = False
+                        loading_box.visible = False
+                        save_btn.disabled = False
+                    finally:
+                        self.page.update()
+                _post_ui(self.page, _apply_after)
+            threading.Thread(target=_fetch_toggles, daemon=True).start()
 
         return ft.Container(
             content=ft.Row([
@@ -846,28 +937,53 @@ class ScanTabUI:
         )
         # 選択状態
         self._selected: set[str] = set()
+        self._scanning: bool = False
 
     def view(self) -> ft.Control:
         return self._view
 
     def scan(self):
+        if self._scanning:
+            return
+        self._scanning = True
         self.list_view.controls.clear()
         self.list_view.controls.append(ft.Row([ft.ProgressRing(), ft.Text("読み込み中...")]))
-        self.page.update()
-        # スキャン（同期）
-        items = scanner.scan_all()
-        self.items = items
-        # 現在の登録済みパスを収集
         try:
-            regs = registry.list_aliases()
-            self._hidden_paths = {os.path.normcase(os.path.abspath(e.exe_path)) for e in regs}
+            self.page.update()
         except Exception:
-            self._hidden_paths = set()
-        self._render_list()
+            pass
+
+        def _work():
+            try:
+                items = scanner.scan_all()
+                def _apply():
+                    self.items = items
+                    # 現在の登録済みパスを収集
+                    try:
+                        regs = registry.list_aliases()
+                        self._hidden_paths = {os.path.normcase(os.path.abspath(e.exe_path)) for e in regs}
+                    except Exception:
+                        self._hidden_paths = set()
+                    self._render_list()
+                    self._scanning = False
+                _post_ui(self.page, _apply)
+            except Exception as ex:
+                def _apply_err():
+                    self.list_view.controls.clear()
+                    self.list_view.controls.append(ft.Text("読み込みに失敗しました", color=ft.colors.RED))
+                    try:
+                        self.page.update()
+                    except Exception:
+                        pass
+                    self._scanning = False
+                _post_ui(self.page, _apply_err)
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _render_list(self):
         q = (self.filter_field.value or "").strip().lower()
         self.list_view.controls.clear()
+
         def norm(p: str) -> str:
             try:
                 return os.path.normcase(os.path.abspath(p))
@@ -905,13 +1021,16 @@ class ScanTabUI:
         # ソート
         def key_name(i: scanner.AppCandidate) -> str:
             return (i.name or "").lower()
+
         def key_exe(i: scanner.AppCandidate) -> str:
             try:
                 return (i.exe_path or "").lower()
             except Exception:
                 return i.exe_path or ""
+
         def key_source(i: scanner.AppCandidate) -> str:
             return (i.source or "").lower()
+
         key_funcs = {"name": key_name, "exe": key_exe, "source": key_source}
         kf = key_funcs.get(self._sort_key, key_name)
         matched.sort(key=kf, reverse=not self._sort_asc)
@@ -1138,19 +1257,31 @@ class ScanTabUI:
             pass
 
     def _clear_selection(self):
-        # 全選択解除して再描画
+        # 全選択解除（再描画せずに既存行のチェックだけ外してステータス更新）
         try:
             self._selected.clear()
         except Exception:
             self._selected = set()
+        # 既存行のチェックボックスをオフ
         try:
-            self._render_list()
+            for item in list(self.list_view.controls):
+                row = getattr(item, "content", None)
+                ctrls = getattr(row, "controls", None)
+                if isinstance(ctrls, list) and ctrls:
+                    cb = ctrls[0]
+                    if isinstance(cb, ft.Checkbox):
+                        cb.value = False
         except Exception:
-            # 少なくとも件数だけは更新
-            try:
-                self._update_status(len(getattr(self, "_visible_keys", set())))
-            except Exception:
-                pass
+            pass
+        # 件数ステータスのみ更新
+        try:
+            self._update_status(len(getattr(self, "_visible_keys", set())))
+        except Exception:
+            pass
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
 
 class SettingsTabUI:
@@ -1233,44 +1364,80 @@ class ScheduleTabUI:
             self.page.update()
         except Exception:
             pass
-        # 取得と再描画
-        self.list_view.controls.clear()
-        tasks = scheduler.list_tasks()
-        if q:
-            tasks = [t for t in tasks if q in t['SimpleName'].lower()]
-        if not tasks:
-            self.list_view.controls.append(ft.Text("タスクはありません", color=ft.colors.GREY))
-        else:
-            for t in tasks:
-                name = t['SimpleName']
-                when = t.get('NextRunTime', '')
-                sched = t.get('Schedule', '')
-                def make_row(simple_name=name, when_text=when, sched_text=sched):
-                    def do_delete(_: ft.ControlEvent):
-                        try:
-                            scheduler.delete_task_by_simple_name(simple_name)
-                            _show_info(self.page, f"削除しました: {simple_name}")
-                            self.refresh()
-                        except Exception as ex:
-                            _show_error(self.page, f"削除に失敗: {ex}")
-                    return ft.Container(
-                        content=ft.Row([
-                            ft.Text(simple_name, expand=True),
-                            ft.Text(when_text, width=200),
-                            ft.Text(sched_text, width=160, color=ft.colors.GREY),
-                            ft.IconButton(ft.icons.DELETE, tooltip="このタスクを削除", on_click=do_delete),
-                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-                        padding=6,
-                    )
-                self.list_view.controls.append(make_row())
-        self.page.update()
-        self._refreshing = False
+
+        def _work():
+            try:
+                tasks = scheduler.list_tasks()
+            except Exception as ex:
+                tasks = []
+
+            def _apply():
+                self.list_view.controls.clear()
+                _tasks = tasks
+                if q:
+                    _tasks = [t for t in _tasks if q in t['SimpleName'].lower()]
+                if not _tasks:
+                    self.list_view.controls.append(ft.Text("タスクはありません", color=ft.colors.GREY))
+                else:
+                    for t in _tasks:
+                        name = t['SimpleName']
+                        when = t.get('NextRunTime', '')
+                        sched = t.get('Schedule', '')
+                        def make_row(simple_name=name, when_text=when, sched_text=sched):
+                            def do_delete(_: ft.ControlEvent):
+                                try:
+                                    scheduler.delete_task_by_simple_name(simple_name)
+                                    _show_info(self.page, f"削除しました: {simple_name}")
+                                    self.refresh()
+                                except Exception as ex:
+                                    _show_error(self.page, f"削除に失敗: {ex}")
+                            return ft.Container(
+                                content=ft.Row([
+                                    ft.Text(simple_name, expand=True),
+                                    ft.Text(when_text, width=200),
+                                    ft.Text(sched_text, width=160, color=ft.colors.GREY),
+                                    ft.IconButton(ft.icons.DELETE, tooltip="このタスクを削除", on_click=do_delete),
+                                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                                padding=6,
+                            )
+                        self.list_view.controls.append(make_row())
+                try:
+                    self.page.update()
+                finally:
+                    self._refreshing = False
+
+            _post_ui(self.page, _apply)
+
+        threading.Thread(target=_work, daemon=True).start()
 
 def main(page: ft.Page):
     page.title = "ShortRun"
-    page.window_width = 980
-    page.window_height = 680
+    # Window icon (absolute path is more reliable for desktop windows)
+    try:
+        ico = _asset_path("shortrun.ico")
+        png = _asset_path("shortrun.png")
+        if os.path.isfile(ico):
+            page.window.icon = ico
+        elif os.path.isfile(png):
+            page.window.icon = png
+    except Exception:
+        pass
+    page.window.width = 980
+    page.window.height = 680
     page.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+
+    # UIスレッド実行ヘルパ（pubsub）を登録しておくと、バックグラウンドからの UI 更新確認が容易
+    try:
+        def _sr_ui_consumer(msg):
+            try:
+                if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "__sr_ui__" and callable(msg[1]):
+                    msg[1]()
+            except Exception:
+                pass
+        page.pubsub.subscribe(_sr_ui_consumer)
+        page._sr_post_ui = lambda fn: page.pubsub.send_all(("__sr_ui__", fn))
+    except Exception:
+        page._sr_post_ui = lambda fn: fn()
 
     cfg = settings.load_config()
     # 初期テーマ適用
@@ -1331,11 +1498,13 @@ def main(page: ft.Page):
 
     scan_ui.on_request_prefill = go_to_alias
 
-    page.add(tabs)
+    # Slight top/left padding to avoid clipping; ensure container expands so inner ListView scrolls
+    page.add(ft.Container(content=tabs, padding=ft.padding.only(left=8, top=8), expand=True))
     # 初期化
     scan_ui.scan()
     alias_ui.refresh()
 
 
 def run_app():
-    ft.app(target=main)
+    # Serve assets for dev and packaged runs
+    ft.app(target=main, assets_dir=_assets_dir())

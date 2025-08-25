@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shortrun"
+version = "0.1.0"
+description = "Win+R エイリアスのGUI管理とスケジューラ連携ツール"
+readme = "README.md"
+authors = [
+  { name = "ShortRun contributors" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+  "flet>=0.24.0",
+  "pywin32>=306",
+]
+keywords = ["Windows", "Win+R", "registry", "Task Scheduler", "Flet"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: Microsoft :: Windows",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: End Users/Desktop",
+  "Environment :: Win32 (MS Windows)",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/clay7614/ShortRun"
+Issues = "https://github.com/clay7614/ShortRun/issues"
+
+[project.scripts]
+shortrun = "shortrun.__main__:run_app"
+
+[tool.setuptools]
+packages = ["shortrun"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+shortrun = ["*.py"]
