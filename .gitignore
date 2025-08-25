@@ -1,0 +1,13 @@
+.venv
+shortrun/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+*.pot
+*.py[cod]
+*.egg-info/
+dist/
+build/
