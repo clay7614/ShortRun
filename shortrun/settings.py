@@ -26,6 +26,7 @@ def _config_path() -> str:
 _DEFAULTS: Dict[str, Any] = {
     "theme": "system",  # system | light | dark
     "last_tab": 0,
+    "show_uninstallers": False,
 }
 
 
@@ -71,5 +72,12 @@ def set_theme(cfg: Dict[str, Any], theme: str) -> Dict[str, Any]:
 def set_last_tab(cfg: Dict[str, Any], index: int) -> Dict[str, Any]:
     cfg = dict(cfg)
     cfg["last_tab"] = int(index)
+    save_config(cfg)
+    return cfg
+
+
+def set_show_uninstallers(cfg: Dict[str, Any], show: bool) -> Dict[str, Any]:
+    cfg = dict(cfg)
+    cfg["show_uninstallers"] = bool(show)
     save_config(cfg)
     return cfg

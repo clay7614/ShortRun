@@ -169,15 +169,15 @@ class AliasTabUI:
         # ソート状態（プログラム一覧）
         self._sort_key: str = "alias"  # alias|path
         self._sort_asc: bool = True
-        self.add_alias_field = ft.TextField(label="プログラム名", width=220, tooltip="Win+R で起動する短い名前。英数・-・_ を推奨")
-        self.add_path_field = ft.TextField(label="実行ファイルパス", expand=True, tooltip="起動したい実行ファイルのパス")
+        self.add_alias_field = ft.TextField(label="名称", width=220, tooltip="Win+R で起動する短い名前。英数・-・_ を推奨")
+        self.add_path_field = ft.TextField(label="ファイルパス", expand=True, tooltip="起動したいファイルのパス")
         self.file_picker = ft.FilePicker(on_result=self._on_file_picked)
         # FilePicker は overlay に追加するのが推奨
         if self.file_picker not in self.page.overlay:
             self.page.overlay.append(self.file_picker)
-        self.open_file_btn = ft.IconButton(ft.icons.FOLDER_OPEN, tooltip="実行ファイルを選択")
+        self.open_file_btn = ft.IconButton(ft.icons.FOLDER_OPEN, tooltip="ファイルを選択")
         self.open_file_btn.on_click = self._pick_file
-        self.add_btn = ft.ElevatedButton(text="追加", icon=ft.icons.ADD, on_click=self._add_alias, tooltip="入力中のプログラム名と実行ファイルパスでプログラムを登録")
+        self.add_btn = ft.ElevatedButton(text="追加", icon=ft.icons.ADD, on_click=self._add_alias, tooltip="入力中の名称とファイルパスでプログラムを登録")
         self.refresh_btn = ft.ElevatedButton(text="再読み込み", icon=ft.icons.REFRESH, tooltip="保存したプログラムを再読み込み", on_click=lambda e: self.refresh())
 
         # ヘッダー（列名 + ソート）
@@ -252,7 +252,7 @@ class AliasTabUI:
         # 再描画
         self.alias_list.controls.clear()
         if not entries:
-            self.alias_list.controls.append(ft.Text("登録されたプログラム名はありません。", color=ft.colors.GREY))
+            self.alias_list.controls.append(ft.Text("登録された名称はありません。", color=ft.colors.GREY))
         else:
             # ソート
             if self._sort_key == "alias":
@@ -645,7 +645,7 @@ class AliasTabUI:
                 ft.Text(ent.exe_path, expand=True, selectable=True),
                 ft.IconButton(ft.icons.SCHEDULE, tooltip="スケジュール設定を開く", on_click=open_schedule_dialog),
                 ft.IconButton(ft.icons.PLAY_ARROW, tooltip="プログラムの起動", on_click=lambda e, p=ent.exe_path: self._launch(p)),
-                ft.IconButton(ft.icons.EDIT, tooltip="プログラム名とパスを編集", on_click=lambda e, entry=ent: self._edit_alias(entry)),
+                ft.IconButton(ft.icons.EDIT, tooltip="名称とパスを編集", on_click=lambda e, entry=ent: self._edit_alias(entry)),
                 ft.IconButton(ft.icons.DELETE, tooltip="プログラムを削除", on_click=lambda e, a=ent.alias: self._remove(a)),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             padding=6,
@@ -656,7 +656,7 @@ class AliasTabUI:
             if self._sort_key == key:
                 return f"{jp} {'▲' if self._sort_asc else '▼'}"
             return jp
-        self.ha_name_btn.text = label_for("alias", "プログラム名")
+        self.ha_name_btn.text = label_for("alias", "名称")
         self.ha_path_btn.text = label_for("path", "パス")
         try:
             self.page.update()
@@ -665,7 +665,12 @@ class AliasTabUI:
 
     def _launch(self, path: str):
         try:
-            subprocess.Popen([path], close_fds=True)
+            lp = (path or "").lower()
+            if lp.endswith(".lnk") or lp.endswith(".url"):
+                # ショートカット/URL は Shell 経由で開く
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen([path], close_fds=True)
         except Exception as ex:
             _show_error(self.page, f"起動に失敗しました: {ex}")
 
@@ -684,8 +689,8 @@ class AliasTabUI:
 
     def _edit_alias(self, entry: registry.AliasEntry):
         page = self.page
-        alias_tf = ft.TextField(label="プログラム名", value=entry.alias, width=220)
-        path_tf = ft.TextField(label="実行ファイルパス", value=entry.exe_path, expand=True)
+        alias_tf = ft.TextField(label="名称", value=entry.alias, width=220)
+        path_tf = ft.TextField(label="ファイルパス", value=entry.exe_path, expand=True)
 
         # ローカル FilePicker（編集用）
         def _on_pick(res: ft.FilePickerResultEvent):
@@ -696,7 +701,15 @@ class AliasTabUI:
         fp = ft.FilePicker(on_result=_on_pick)
         if fp not in page.overlay:
             page.overlay.append(fp)
-        pick_btn = ft.IconButton(ft.icons.FOLDER_OPEN, tooltip="実行ファイルを選択", on_click=lambda e: fp.pick_files(allow_multiple=False, allowed_extensions=["exe"], dialog_title="実行ファイルを選択"))
+        pick_btn = ft.IconButton(
+            ft.icons.FOLDER_OPEN,
+            tooltip="ファイル / ショートカットを選択",
+            on_click=lambda e: fp.pick_files(
+                allow_multiple=False,
+                file_type=ft.FilePickerFileType.ANY,
+                dialog_title="ファイルまたはショートカットを選択",
+            ),
+        )
 
         content = ft.Container(
             width=560,
@@ -710,7 +723,7 @@ class AliasTabUI:
             new_alias = (alias_tf.value or "").strip()
             new_path = (path_tf.value or "").strip().strip('"')
             if not new_alias or not new_path:
-                _show_error(page, "プログラム名と実行ファイルのパスを入力してください。")
+                _show_error(page, "名称とファイルのパスを入力してください。")
                 return
             try:
                 registry.update_alias(entry.alias, new_alias, new_path, overwrite=overwrite)
@@ -739,7 +752,7 @@ class AliasTabUI:
                     except Exception as ex:
                         _show_error(page, f"上書きに失敗: {ex}")
                 confirm = ft.AlertDialog(
-                    title=ft.Text("既存のプログラム名"),
+                    title=ft.Text("既存の名称"),
                     content=ft.Text(f"{new_alias} は既に存在します。上書きしますか？"),
                     actions=[
                         ft.TextButton("キャンセル", on_click=lambda _: page.close(confirm)),
@@ -766,7 +779,11 @@ class AliasTabUI:
         page.open(dlg)
 
     def _pick_file(self, e: ft.ControlEvent):
-        self.file_picker.pick_files(allow_multiple=False, allowed_extensions=["exe"], dialog_title="実行ファイルを選択")
+        self.file_picker.pick_files(
+            allow_multiple=False,
+            file_type=ft.FilePickerFileType.ANY,
+            dialog_title="ファイルまたはショートカットを選択",
+        )
 
     def _on_file_picked(self, e: ft.FilePickerResultEvent):
         if e.files:
@@ -780,7 +797,7 @@ class AliasTabUI:
         alias = self.add_alias_field.value.strip()
         path = self.add_path_field.value.strip().strip('"')
         if not alias or not path:
-            _show_error(self.page, "プログラム名と実行ファイルのパスを入力してください。")
+            _show_error(self.page, "名称とファイルのパスを入力してください。")
             return
         try:
             registry.add_alias(alias, path, overwrite=False)
@@ -808,8 +825,8 @@ class AliasTabUI:
                 except Exception as ex:
                     _show_error(self.page, f"上書きに失敗: {ex}")
             dialog = ft.AlertDialog(
-                title=ft.Text("既存のプログラム名"),
-                content=ft.Text("同名のプログラム名が存在します。上書きしますか？"),
+                title=ft.Text("既存の名称"),
+                content=ft.Text("同名の名称が存在します。上書きしますか？"),
                 actions=[
                     ft.TextButton("キャンセル", on_click=lambda _: self.page.close(dialog)),
                     ft.TextButton("上書き", on_click=do_overwrite),
@@ -859,10 +876,11 @@ class AliasTabUI:
             _show_error(self.page, f"追加に失敗: {ex}")
 
 class ScanTabUI:
-    def __init__(self, page: ft.Page, on_alias_added: Optional[Callable[[], None]] = None, on_request_prefill: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, page: ft.Page, on_alias_added: Optional[Callable[[], None]] = None, on_request_prefill: Optional[Callable[[str, str], None]] = None, *, cfg: Optional[dict] = None):
         self.page = page
         self.on_alias_added = on_alias_added
         self.on_request_prefill = on_request_prefill
+        self.cfg = cfg or {}
         self.items: List[scanner.AppCandidate] = []
         self._hidden_paths: set[str] = set()  # 既に登録済みの exe パス（正規化）
         self._visible_keys: set[str] = set()  # 現在表示中の候補キー（正規化パス）
@@ -955,7 +973,9 @@ class ScanTabUI:
 
         def _work():
             try:
-                items = scanner.scan_all()
+                show_uninst = bool((self.cfg or {}).get("show_uninstallers", False))
+                items = scanner.scan_all(show_uninstallers=show_uninst)
+
                 def _apply():
                     self.items = items
                     # 現在の登録済みパスを収集
@@ -966,8 +986,9 @@ class ScanTabUI:
                         self._hidden_paths = set()
                     self._render_list()
                     self._scanning = False
+
                 _post_ui(self.page, _apply)
-            except Exception as ex:
+            except Exception:
                 def _apply_err():
                     self.list_view.controls.clear()
                     self.list_view.controls.append(ft.Text("読み込みに失敗しました", color=ft.colors.RED))
@@ -976,6 +997,7 @@ class ScanTabUI:
                     except Exception:
                         pass
                     self._scanning = False
+
                 _post_ui(self.page, _apply_err)
 
         threading.Thread(target=_work, daemon=True).start()
@@ -1004,13 +1026,13 @@ class ScanTabUI:
         def passes(i: scanner.AppCandidate) -> bool:
             name = (i.name or "").lower()
             base = os.path.basename(i.exe_path).lower()
-            src = (i.source or "").lower()
-            hay = [name, base, src]
+            # 検索対象は名称とパス（ソースは対象外）
+            hay = [name, base]
             # include は AND（すべて含む）
             if include_terms and not all(any(t in h for h in hay) for t in include_terms):
                 return False
             # exclude は OR（いずれか含めば除外）
-            if any(t and (t in name or t in base or t in src) for t in exclude_terms):
+            if any(t and (t in name or t in base) for t in exclude_terms):
                 return False
             # include 指定が無い場合は全件対象
             return True
@@ -1077,14 +1099,14 @@ class ScanTabUI:
             self.page.update()
 
         def create_alias(_: ft.ControlEvent):
-            # ダイアログでプログラム名を編集してから登録
+            # ダイアログで名称を編集してから登録
             suggested = _slugify(it.name) if it.name else _slugify(os.path.splitext(os.path.basename(it.exe_path))[0])
-            alias_tf = ft.TextField(label="プログラム名", value=suggested, width=320)
+            alias_tf = ft.TextField(label="名称", value=suggested, width=320)
 
             def do_register(e: ft.ControlEvent, *, overwrite: bool = False):
                 name = (alias_tf.value or "").strip()
                 if not name:
-                    _show_error(self.page, "プログラム名を入力してください")
+                    _show_error(self.page, "名称を入力してください")
                     return
                 try:
                     registry.add_alias(name, it.exe_path, overwrite=overwrite)
@@ -1122,7 +1144,7 @@ class ScanTabUI:
                         except Exception as ex:
                             _show_error(self.page, f"上書きに失敗: {ex}")
                     confirm = ft.AlertDialog(
-                        title=ft.Text("既存のプログラム名"),
+                        title=ft.Text("既存の名称"),
                         content=ft.Text(f"{name} は既に存在します。上書きしますか？"),
                         actions=[
                             ft.TextButton("キャンセル", on_click=lambda _: self.page.close(confirm)),
@@ -1178,7 +1200,7 @@ class ScanTabUI:
             tf = ft.TextField(value=suggested, width=300)
             rows.append((it, tf))
 
-        overwrite_cb = ft.Checkbox(label="既存のプログラム名は上書きする", value=False)
+        overwrite_cb = ft.Checkbox(label="既存の名称は上書きする", value=False)
 
         items_column = ft.Column([
             ft.Row([ft.Text(os.path.basename(it.exe_path), width=280), tf], spacing=12)
@@ -1189,7 +1211,7 @@ class ScanTabUI:
             width=700,
             height=480,
             content=ft.Column([
-                ft.Text("一括追加: プログラム名を確認・編集してから登録します", color=ft.colors.GREY),
+                ft.Text("一括追加: 名称を確認・編集してから登録します", color=ft.colors.GREY),
                 ft.Container(content=items_column, expand=True, bgcolor=ft.colors.with_opacity(0.02, ft.colors.BLACK), padding=8),
                 overwrite_cb,
             ], spacing=10, tight=True, scroll=ft.ScrollMode.ALWAYS),
@@ -1201,7 +1223,7 @@ class ScanTabUI:
             for it, tf in rows:
                 name = (tf.value or "").strip()
                 if not name:
-                    errors.append((os.path.basename(it.exe_path), "プログラム名が未入力"))
+                    errors.append((os.path.basename(it.exe_path), "名称が未入力"))
                     continue
                 try:
                     registry.add_alias(name, it.exe_path, overwrite=bool(overwrite_cb.value))
@@ -1285,9 +1307,10 @@ class ScanTabUI:
 
 
 class SettingsTabUI:
-    def __init__(self, page: ft.Page, cfg: dict):
+    def __init__(self, page: ft.Page, cfg: dict, on_config_changed: Optional[Callable[[], None]] = None):
         self.page = page
         self.cfg = cfg
+        self._on_config_changed = on_config_changed
         # テーマ
         self.theme_dropdown = ft.Dropdown(
             label="テーマ",
@@ -1304,15 +1327,75 @@ class SettingsTabUI:
             content=ft.Column([
                 ft.Text("設定", weight=ft.FontWeight.BOLD, size=18),
                 self.theme_dropdown,
+                ft.Row([
+                    ft.Switch(
+                        label="アプリ一覧にアンインストーラを表示する(要再起動)",
+                        value=bool(cfg.get("show_uninstallers", False)),
+                        on_change=self._on_toggle_uninstaller,
+                    )
+                ]),
                 ft.Divider(),
                 ft.Text("その他"),
-                ft.Text("対応予定の機能はありません．", color=ft.colors.GREY),
+                ft.Text("Tips: エラーや不具合が発生した場合はgithubのREADMEを参考にするか、\nissuesでの報告をお願いします。", color=ft.colors.GREY),
+                # GitHub ヘルプアイコン（ICO画像）。テーマに応じて白/黒へ反転させる
+                self._build_help_icon(),
             ], expand=False, spacing=12),
             padding=ft.padding.only(top=12, left=12, right=12, bottom=8),
         )
 
     def view(self) -> ft.Control:
         return self._view
+
+    def _build_help_icon(self) -> ft.Control:
+        # 画像本体
+        try:
+            icon_path = _asset_path("github.ico")
+        except Exception:
+            icon_path = os.path.join("assets", "github.ico")
+        self.help_img = ft.Image(src=icon_path, width=26, height=26)
+        # 可能ならブレンドモードで単色化を有効にする
+        try:
+            bm = getattr(ft, "BlendMode", None)
+            if bm is not None:
+                self.help_img.color_blend_mode = bm.SRC_IN
+        except Exception:
+            pass
+        # コンテナでクリック/ツールチップを付与
+        help_btn = ft.Container(
+            content=self.help_img,
+            tooltip="ヘルプ (GitHub) を開く",
+            on_click=lambda e: self.page.launch_url(
+                "https://github.com/clay7614/ShortRun?tab=readme-ov-file#%E4%B8%80%E8%88%AC%E3%83%A6%E3%83%BC%E3%82%B6%E3%83%BC%E5%90%91%E3%81%91"
+            ),
+            padding=4,
+        )
+        # 初期色の適用
+        self._apply_help_icon_theme()
+        return help_btn
+
+    def _apply_help_icon_theme(self):
+        # 現在のテーマから明暗を推定し、アイコン色を白/黒で反転
+        try:
+            # page.theme_mode が LIGHT/DARK/SYSTEM のいずれか
+            mode = getattr(self.page, "theme_mode", None)
+            is_dark = False
+            if mode == ft.ThemeMode.DARK:
+                is_dark = True
+            elif mode == ft.ThemeMode.LIGHT:
+                is_dark = False
+            else:
+                # SYSTEM の場合は platform_brightness があれば参照（無ければライト扱い）
+                pb = getattr(self.page, "platform_brightness", None)
+                # flet では "dark" / "light" の文字列または Brightness 列挙が入る可能性に配慮
+                if str(pb).lower().endswith("dark"):
+                    is_dark = True
+            self.help_img.color = ft.colors.WHITE if is_dark else ft.colors.BLACK
+        except Exception:
+            # フォールバック: 黒
+            try:
+                self.help_img.color = ft.colors.BLACK
+            except Exception:
+                pass
 
     def _on_theme_changed(self, e: ft.ControlEvent):
         theme = self.theme_dropdown.value or "system"
@@ -1324,15 +1407,30 @@ class SettingsTabUI:
             self.page.theme_mode = ft.ThemeMode.DARK
         else:
             self.page.theme_mode = ft.ThemeMode.SYSTEM
+        # ヘルプアイコンの色も更新
+        try:
+            self._apply_help_icon_theme()
+        except Exception:
+            pass
         self.page.update()
 
     # 自動起動設定は削除済み
+
+    def _on_toggle_uninstaller(self, e: ft.ControlEvent):
+        show = bool(e.control.value)
+        self.cfg = settings.set_show_uninstallers(self.cfg, show)
+        if callable(self._on_config_changed):
+            try:
+                self._on_config_changed()
+            except Exception:
+                pass
+        self.page.update()
 
 
 class ScheduleTabUI:
     def __init__(self, page: ft.Page):
         self.page = page
-        self.alias_filter = ft.TextField(hint_text="プログラム名でフィルタ", width=240, on_change=lambda e: self.refresh())
+        self.alias_filter = ft.TextField(hint_text="スケジュール名でフィルタ", width=240, on_change=lambda e: self.refresh())
         self.refresh_btn = ft.IconButton(ft.icons.REFRESH, tooltip="再読み込み", on_click=lambda e: self.refresh())
         self.list_view = ft.ListView(expand=True, spacing=4, padding=8)
         self._refreshing = False
@@ -1411,7 +1509,7 @@ class ScheduleTabUI:
         threading.Thread(target=_work, daemon=True).start()
 
 def main(page: ft.Page):
-    page.title = "ShortRun"
+    page.title = "ShortRUN"
     # Window icon (absolute path is more reliable for desktop windows)
     try:
         ico = _asset_path("shortrun.ico")
@@ -1449,10 +1547,10 @@ def main(page: ft.Page):
         page.theme_mode = ft.ThemeMode.SYSTEM
 
     alias_ui = AliasTabUI(page)
-    scan_ui = ScanTabUI(page, on_alias_added=alias_ui.refresh)
+    scan_ui = ScanTabUI(page, on_alias_added=alias_ui.refresh, cfg=cfg)
     # 双方向の通知: エイリアス変更時に探索を再描画
     alias_ui.on_alias_changed = scan_ui.scan
-    settings_ui = SettingsTabUI(page, cfg)
+    settings_ui = SettingsTabUI(page, cfg, on_config_changed=lambda: scan_ui.scan())
     schedule_tab = ScheduleTabUI(page)
 
     def on_tab_changed(e: ft.ControlEvent):

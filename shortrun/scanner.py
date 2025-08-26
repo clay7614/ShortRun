@@ -37,6 +37,43 @@ class AppCandidate:
     source: str  # uninstall64/uninstall32/startmenu_system/startmenu_user
 
 
+# Browser-based installed app proxy executables (PWA proxies etc.) to exclude
+_PROXY_NAMES = {
+    "chrome_proxy.exe",
+    "brave_proxy.exe",
+    "msedge_proxy.exe",
+    "edge_proxy.exe",
+    "vivaldi_proxy.exe",
+    "opera_proxy.exe",
+}
+
+
+def _is_proxy_exe(path: str) -> bool:
+    try:
+        b = os.path.basename(path or "").lower()
+    except Exception:
+        return False
+    return b.endswith("_proxy.exe") or b in _PROXY_NAMES
+
+
+_UNINSTALL_PATTERNS = (
+    r"(^|[^a-z])uninstall(er)?([^a-z]|$)",
+    r"(^|[^a-z])setup([^a-z]|$)",
+    r"(^|[^a-z])unins([^a-z]|$)",
+    r"(^|[^a-z])remove(r)?([^a-z]|$)",
+)
+_uninst_re = re.compile("|".join(_UNINSTALL_PATTERNS), re.IGNORECASE)
+
+
+def _looks_uninstaller(name_or_path: str) -> bool:
+    try:
+        s = (name_or_path or "")
+    except Exception:
+        return False
+    b = os.path.basename(s)
+    return bool(_uninst_re.search(b))
+
+
 def _run_no_window(args: List[str], **kwargs) -> subprocess.CompletedProcess:
     """Run subprocess without showing a console window on Windows.
     Returns CompletedProcess. Adds startupinfo/creationflags when os.name == 'nt'.
@@ -106,7 +143,7 @@ def _extract_exe_from_display_icon(display_icon: str) -> Optional[str]:
     return None
 
 
-def scan_uninstall() -> List[AppCandidate]:
+def scan_uninstall(*, show_uninstallers: bool = False) -> List[AppCandidate]:
     results: List[AppCandidate] = []
     for root, path, access in UNINSTALL_REG_PATHS:
         source = (
@@ -127,7 +164,15 @@ def scan_uninstall() -> List[AppCandidate]:
                 guess = os.path.join(install_loc, f"{display_name}.exe")
                 if os.path.isfile(guess):
                     exe = guess
+            # exclude browser proxy executables
+            if exe and _is_proxy_exe(exe):
+                continue
             if exe:
+                # exclude obvious uninstallers unless explicitly allowed
+                if not show_uninstallers and (
+                    _looks_uninstaller(exe) or _looks_uninstaller(display_name or "")
+                ):
+                    continue
                 results.append(AppCandidate(name=display_name, exe_path=exe, source=source))
     return results
 
@@ -223,28 +268,31 @@ def _resolve_shortcuts_in_dir(root_dir: str) -> Dict[str, str]:
         return {}
 
 
-def scan_start_menu() -> List[AppCandidate]:
+def scan_start_menu(*, show_uninstallers: bool = False) -> List[AppCandidate]:
+    """Start menu shortcuts as candidates (use .lnk path itself).
+    We keep resolution helpers for other uses, but list .lnk directly so that
+    even PWA-style proxies appear as friendly shortcuts instead of raw exe.
+    """
     results: List[AppCandidate] = []
     for i, d in enumerate(START_MENU_DIRS):
         src = "startmenu_system" if i == 0 else "startmenu_user"
-        # Prefer batch resolution for performance in packaged envs
-        mapping = _resolve_shortcuts_in_dir(d)
-        if mapping:
-            for lnk, exe in mapping.items():
-                name = os.path.splitext(os.path.basename(lnk))[0]
-                results.append(AppCandidate(name=name, exe_path=exe, source=src))
+        if not d or not os.path.isdir(d):
             continue
-        # Fallback to per-link resolution
-        for lnk in _iter_shortcuts(d) or []:
-            exe = _resolve_lnk_target(lnk)
-            if exe:
-                name = os.path.splitext(os.path.basename(lnk))[0]
-                results.append(AppCandidate(name=name, exe_path=exe, source=src))
+        for base, _dirs, files in os.walk(d):
+            for fn in files:
+                if not fn.lower().endswith(".lnk"):
+                    continue
+                lnk = os.path.join(base, fn)
+                name = os.path.splitext(fn)[0]
+                # .lnk 名がアンインストーラっぽい場合は除外（許可時は通す）
+                if (not show_uninstallers) and (_looks_uninstaller(name) or _looks_uninstaller(lnk)):
+                    continue
+                results.append(AppCandidate(name=name, exe_path=lnk, source=src))
     return results
 
 
-def scan_all(dedup: bool = True) -> List[AppCandidate]:
-    items = scan_uninstall() + scan_start_menu()
+def scan_all(dedup: bool = True, *, show_uninstallers: bool = False) -> List[AppCandidate]:
+    items = scan_uninstall(show_uninstallers=show_uninstallers) + scan_start_menu(show_uninstallers=show_uninstallers)
     if not dedup:
         return items
     seen: Dict[str, AppCandidate] = {}

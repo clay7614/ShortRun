@@ -7,7 +7,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets\\shortrun.ico', 'assets'),
-        ('assets\\shortrun.svg', 'assets'),
+        ('assets\\github.ico', 'assets'),
     ],
     hiddenimports=[],
     hookspath=[],
