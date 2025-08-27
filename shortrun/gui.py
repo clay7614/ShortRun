@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import subprocess
+import shlex
 import ctypes
 import time
 import threading
@@ -86,6 +87,39 @@ def _post_ui(page: ft.Page, fn: Callable[[], None]):
             fn()
         except Exception:
             pass
+
+
+# --- Windows helpers ---------------------------------------------------------
+def _resolve_windows_shortcut(path: str) -> Tuple[str, str, Optional[str]]:
+    """.lnk を解決して (target, arguments, working_dir) を返す。
+    失敗時は元のパスを返す（arguments は空）。
+    """
+    try:
+        if os.name != 'nt' or (path or '').lower().endswith('.lnk') is False:
+            return path, "", None
+        # win32com は pywin32 に含まれる
+        import win32com.client  # type: ignore
+        shell = win32com.client.Dispatch("WScript.Shell")
+        sc = shell.CreateShortcut(path)
+        target = sc.Targetpath or path
+        args = sc.Arguments or ""
+        workdir = sc.WorkingDirectory or None
+        return target, args, workdir
+    except Exception:
+        return path, "", None
+
+def _shell_execute_runas(file: str, params: Optional[str] = None, cwd: Optional[str] = None) -> None:
+    """ShellExecuteW("runas") を呼ぶ薄いラッパ。エラー時は例外を投げる。"""
+    if os.name != 'nt':
+        raise OSError("runas is only supported on Windows")
+    # None を渡すより空文字の方が安定するケースがある
+    lpFile = file
+    lpParameters = params or ""
+    lpDirectory = cwd or None
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", lpFile, lpParameters, lpDirectory, 1)
+    # 32 以下はエラーコード（HINSTANCE の擬似コード）
+    if rc <= 32:
+        raise OSError(f"ShellExecuteW failed with code {rc}")
 
 
 def _show_banner(page: ft.Page, message: str, *, error: bool = False, duration: float = 2.5):
@@ -287,29 +321,20 @@ class AliasTabUI:
             logon_sw = ft.Switch(label="ログオン時に起動", value=False, disabled=True)
             onstart_sw = ft.Switch(label="Windows起動時に起動", value=False, disabled=True)
 
-            # 毎日
-            daily_tf = ft.TextField(label="時刻 (HH:MM)", width=140)
-            # 毎分
-            min_every = ft.TextField(label="間隔(分)", width=140)
-            min_start = ft.TextField(label="開始時刻 HH:MM", width=160)
-            # 毎時
+            # 毎時（時刻フィールドは廃止し開始時刻に統合）
             hr_every = ft.TextField(label="間隔(時間)", width=160)
-            hr_start = ft.TextField(label="開始時刻 HH:MM", width=160)
-            # 毎週
-            weekly_time = ft.TextField(label="時刻 (HH:MM)", width=160)
+            # 毎週（時刻フィールドは廃止し開始時刻に統合）
             weekly_interval = ft.TextField(label="間隔(週)", width=120)
             wd_labels = ["月","火","水","木","金","土","日"]
             wd_check: list[ft.Checkbox] = [ft.Checkbox(label=l, value=False) for l in wd_labels]
-            # 毎月
-            monthly_time = ft.TextField(label="時刻 (HH:MM)", width=160)
+            # 毎月（時刻フィールドは廃止し開始時刻に統合）
             monthly_days = ft.TextField(label="日付 (例: 1,15,LAST)", width=240)
             monthly_months = ft.TextField(label="対象月 (例: 1,2,3) ※任意", width=240, tooltip="JAN〜DEC も可。数値は1〜12")
             monthly_interval = ft.TextField(label="間隔(月)", width=120)
             # 1回のみ
             once_date = ft.TextField(label="日付 (YYYY/MM/DD)", width=180)
-            once_time = ft.TextField(label="時刻 (HH:MM)", width=140)
             # 共通タスク名（任意）
-            schedule_name_tf = ft.TextField(label="タスク名 (任意)", width=420, tooltip="未入力なら自動命名。種別や時刻を変えると自動更新します")
+            schedule_name_tf = ft.TextField(label="タスク名 (任意)", width=420, tooltip="未入力なら自動命名。種別や開始時刻を変えると自動更新します")
             name_user_override = {"v": False}
 
             # 日付ピッカー（必要時に生成して開く: 表示崩れ防止）
@@ -339,22 +364,23 @@ class AliasTabUI:
             once_pick_btn = ft.IconButton(ft.icons.CALENDAR_MONTH, tooltip="カレンダーから選択", on_click=lambda e: _open_dp(once_date))
 
             # 期間オプション（共通）
-            # 開始/終了のマスター有効チェックと各UTCチェック
-            start_enable_cb = ft.Checkbox(label="開始タイミングを有効", value=False)
-            sd_tf = ft.TextField(label="開始日 YYYY/MM/DD", width=190, tooltip="空欄可", disabled=not start_enable_cb.value)
-            st_tf = ft.TextField(label="開始時刻 HH:MM", width=160, tooltip="空欄可", disabled=not start_enable_cb.value)
-            start_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False, tooltip="開始の時刻をUTCで指定 (/Z)", disabled=not start_enable_cb.value)
+            # 開始のマスター有効チェックは廃止。開始設定は常に編集可能で、未入力なら適用しない。
+            sd_tf = ft.TextField(label="開始日 YYYY/MM/DD", width=190, tooltip="空欄可")
+            st_tf = ft.TextField(label="開始時刻 HH:MM", width=160, tooltip="空欄可")
+            start_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False, tooltip="開始の時刻をUTCで指定 (/Z)")
             end_enable_cb = ft.Checkbox(label="終了タイミングを有効", value=False)
             ed_tf = ft.TextField(label="終了日 YYYY/MM/DD", width=190, tooltip="空欄可", disabled=not end_enable_cb.value)
             et_tf = ft.TextField(label="終了時刻 HH:MM", width=160, tooltip="空欄可", disabled=not end_enable_cb.value)
             end_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False, tooltip="終了の時刻をUTCで指定 (/Z)", disabled=not end_enable_cb.value)
             du_enable_cb = ft.Checkbox(label="停止するまでの時間を有効", value=False)
             du_tf = ft.TextField(label="停止するまでの時間 HHH:MM", width=220, tooltip="空欄可。例 02:00", disabled=not du_enable_cb.value)
-            # その他: 繰り返し起動
+            # その他: 繰り返し起動（セクション有効トグル追加）
+            rep_enable_cb = ft.Checkbox(label="繰り返し起動を有効", value=False)
             rep_interval_tf = ft.TextField(label="起動の間隔(分)", width=180, tooltip="空欄可。1以上の整数")
             rep_duration_tf = ft.TextField(label="継続時間 HHH:MM", width=220, tooltip="空欄可。例 02:00")
-            # ランダム遅延・UTC・終了時停止
-            random_delay_tf = ft.TextField(label="遅延（ランダム）(分)", width=180, tooltip="空欄可。例 60")
+            # ランダム遅延・UTC・終了時停止（遅延は専用セクション有効トグル追加）
+            delay_enable_cb = ft.Checkbox(label="遅延時間を有効", value=False)
+            random_delay_tf = ft.TextField(label="遅延（ランダム）(分)", width=180, tooltip="空欄可。例 60", disabled=True)
             stop_at_end_cb = ft.Checkbox(label="繰り返し継続時間の最後に実行中のすべてのタスクを停止する", value=False)
             sd_pick_btn = ft.IconButton(ft.icons.CALENDAR_TODAY, tooltip="開始日を選択", on_click=lambda e: _open_dp(sd_tf))
             ed_pick_btn = ft.IconButton(ft.icons.EVENT, tooltip="終了日を選択", on_click=lambda e: _open_dp(ed_tf))
@@ -363,13 +389,7 @@ class AliasTabUI:
             now = dt.datetime.now()
             hhmm_now = now.strftime("%H:%M")
             ymd_now = now.strftime("%Y/%m/%d")
-            daily_tf.value = hhmm_now
-            min_start.value = hhmm_now
-            hr_start.value = hhmm_now
-            weekly_time.value = hhmm_now
-            monthly_time.value = hhmm_now
             once_date.value = ymd_now
-            once_time.value = hhmm_now
             sd_tf.value = ymd_now
 
             # 起動/ログオントグルは廃止
@@ -390,7 +410,6 @@ class AliasTabUI:
                 width=300,
                 options=[
                     ft.dropdown.Option("DAILY", "毎日"),
-                    ft.dropdown.Option("MIN", "毎分"),
                     ft.dropdown.Option("HOUR", "毎時"),
                     ft.dropdown.Option("WEEK", "毎週"),
                     ft.dropdown.Option("MONTH", "毎月"),
@@ -405,19 +424,18 @@ class AliasTabUI:
             schedule_type_dd.disabled = False
 
             # 各セクション（表示は選択に応じて切替）
-            sec_daily = ft.Container(content=ft.Column([ft.Row([daily_tf], spacing=8)], spacing=8), visible=False)
-            sec_min = ft.Container(content=ft.Column([ft.Row([min_every, min_start], spacing=8)], spacing=8), visible=False)
-            sec_hour = ft.Container(content=ft.Column([ft.Row([hr_every, hr_start], spacing=8)], spacing=8), visible=False)
+            sec_daily = ft.Container(content=ft.Column([], spacing=8), visible=False)
+            sec_hour = ft.Container(content=ft.Column([ft.Row([hr_every], spacing=8)], spacing=8), visible=False)
             sec_week = ft.Container(content=ft.Column([
-                ft.Row([weekly_time, weekly_interval], spacing=8),
+                ft.Row([weekly_interval], spacing=8),
                 ft.Row(wd_check, spacing=8),
             ], spacing=8), visible=False)
             sec_month = ft.Container(content=ft.Column([
-                ft.Row([monthly_time, monthly_interval], spacing=8),
+                ft.Row([monthly_interval], spacing=8),
                 ft.Row([monthly_days, monthly_months], spacing=8),
             ], spacing=8), visible=False)
             sec_once = ft.Container(content=ft.Column([
-                ft.Row([once_date, once_pick_btn, once_time], spacing=8),
+                ft.Row([once_date, once_pick_btn], spacing=8),
             ], spacing=8), visible=False)
             # アイドル
             idle_tf2 = ft.TextField(label="アイドル分", width=140)
@@ -463,24 +481,20 @@ class AliasTabUI:
                         name += f"_{_sanitize(suffix)}"
                     return name
                 if typ == "DAILY":
-                    hhmm = (daily_tf.value or "").strip()
+                    hhmm = (st_tf.value or "").strip()
                     return _tn("DAILY", hhmm.replace(":","-"))
-                if typ == "MIN":
-                    every = (min_every.value or "").strip() or "1"
-                    st = (min_start.value or "").strip()
-                    return _tn("MINUTE", f"every{every}_at_{st.replace(':','-')}")
                 if typ == "HOUR":
                     every = (hr_every.value or "").strip() or "1"
-                    st = (hr_start.value or "").strip()
+                    st = (st_tf.value or "").strip()
                     return _tn("HOURLY", f"every{every}_at_{st.replace(':','-')}")
                 if typ == "WEEK":
                     d = _wd_tokens()
-                    hhmm = (weekly_time.value or "").strip()
+                    hhmm = (st_tf.value or "").strip()
                     interval = (weekly_interval.value or "").strip() or "1"
                     dstr = ",".join(d) if d else "MON"
                     return _tn("WEEKLY", f"{dstr}_{hhmm.replace(':','-')}_every{interval}")
                 if typ == "MONTH":
-                    hhmm = (monthly_time.value or "").strip()
+                    hhmm = (st_tf.value or "").strip()
                     d = ",".join([(s or "").strip().upper() for s in (monthly_days.value or "").split(',') if s.strip()]) or "1"
                     m = [s for s in (monthly_months.value or "").split(',') if s.strip()]
                     m_abbr = _month_abbr_list(m)
@@ -491,7 +505,7 @@ class AliasTabUI:
                     return _tn("MONTHLY", suffix)
                 if typ == "ONCE":
                     d = (once_date.value or "").strip().replace('/','-')
-                    t_ = (once_time.value or "").strip().replace(':','-')
+                    t_ = (st_tf.value or "").strip().replace(':','-')
                     return _tn("ONCE", f"{d}_{t_}")
                 if typ == "LOGON":
                     return _tn("ONLOGON")
@@ -518,7 +532,6 @@ class AliasTabUI:
             def _update_sections(_: Optional[ft.ControlEvent] = None):
                 typ = schedule_type_dd.value
                 sec_daily.visible = typ == "DAILY"
-                sec_min.visible = typ == "MIN"
                 sec_hour.visible = typ == "HOUR"
                 sec_week.visible = typ == "WEEK"
                 sec_month.visible = typ == "MONTH"
@@ -542,70 +555,89 @@ class AliasTabUI:
                 except Exception:
                     pass
             # マスター切替
-            start_enable_cb.on_change = lambda e: _toggle_enabled(start_enable_cb, [sd_tf, st_tf, start_utc_cb])
             end_enable_cb.on_change = lambda e: _toggle_enabled(end_enable_cb, [ed_tf, et_tf, end_utc_cb])
-            du_enable_cb.on_change = lambda e: _toggle_enabled(du_enable_cb, du_tf)
+            du_enable_cb.on_change = lambda e: _toggle_enabled(du_enable_cb, [du_tf])
+            rep_enable_cb.on_change = lambda e: _toggle_enabled(rep_enable_cb, [rep_interval_tf, rep_duration_tf, stop_at_end_cb])
+            delay_enable_cb.on_change = lambda e: _toggle_enabled(delay_enable_cb, [random_delay_tf])
 
-            # 期間指定: 開始行と終了行それぞれの右端にUTCチェック
-            window_opts = ft.Container(
+            # 期間指定セクションのマスター有効は無し
+
+            # 期間指定セクション（開始はタスク名の下へ移動済み、ここでは終了のみ）
+            window_section = ft.Container(
                 expand=True,
                 content=ft.Column([
-                    ft.Container(
-                        content=ft.Text("期間指定", color=ft.colors.GREY),
-                        padding=ft.padding.only(bottom=8),
-                    ),
-                    ft.Row([
-                        ft.Row([start_enable_cb, sd_tf, sd_pick_btn, st_tf, start_utc_cb], spacing=8, expand=True),
-                    ], alignment=ft.MainAxisAlignment.START),
+                    ft.Row([ft.Text("期間指定", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
                     ft.Row([
                         ft.Row([end_enable_cb, ed_tf, ed_pick_btn, et_tf, end_utc_cb], spacing=8, expand=True),
                     ], alignment=ft.MainAxisAlignment.START),
-                    ft.Row([du_enable_cb, du_tf], spacing=8),
                 ], spacing=8),
             )
 
-            # 遅延時間オプションは削除
+            # 停止時間セクション（見出しの下に有効チェックを配置）
+            stop_section = ft.Container(
+                content=ft.Column([
+            ft.Row([ft.Text("停止時間", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+            ft.Row([du_enable_cb], alignment=ft.MainAxisAlignment.START),
+            ft.Row([du_tf], alignment=ft.MainAxisAlignment.START, spacing=8),
+                ], spacing=8),
+            )
 
-            # オプション（任意）全体をまとめる
+            # 繰り返し起動セクション（見出しの下に有効チェックを配置）
+            repeat_section = ft.Container(
+                content=ft.Column([
+            ft.Row([ft.Text("繰り返し起動", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+            ft.Row([rep_enable_cb], alignment=ft.MainAxisAlignment.START),
+                    ft.Row([rep_interval_tf, rep_duration_tf], spacing=8),
+                    ft.Row([stop_at_end_cb], spacing=8),
+                ], spacing=8),
+            )
+
+            # 遅延時間セクション（見出しの下に有効チェックを配置）
+            delay_section = ft.Container(
+                content=ft.Column([
+            ft.Row([ft.Text("遅延時間", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+            ft.Row([delay_enable_cb], alignment=ft.MainAxisAlignment.START),
+                    ft.Row([random_delay_tf], spacing=12),
+                ], spacing=8),
+            )
+
+            # まとめ
             options_group = ft.Container(
                 content=ft.Column([
-                    ft.Container(
-                        content=ft.Text("オプション（任意）", color=ft.colors.GREY),
-                        padding=ft.padding.only(bottom=8),
-                    ),
-                    ft.Column([
-                        window_opts,
-                        ft.Text("繰り返し起動する", color=ft.colors.GREY),
-                        ft.Container(
-                            content=ft.Column([
-                                ft.Row([rep_interval_tf, rep_duration_tf], spacing=8),
-                                ft.Row([stop_at_end_cb], spacing=8),
-                            ], spacing=8),
-                        ),
-                        ft.Divider(),
-                        ft.Text("その他の詳細設定", color=ft.colors.GREY),
-                        ft.Row([random_delay_tf], spacing=12),
-                    ], spacing=16),
-                ], spacing=8),
+                    window_section,
+                    stop_section,
+                    repeat_section,
+                    delay_section,
+                ], spacing=16),
             )
+
+            # 初期のセクション有効状態反映
+            _toggle_enabled(du_enable_cb, [du_tf])
+            _toggle_enabled(rep_enable_cb, [rep_interval_tf, rep_duration_tf, stop_at_end_cb])
+            _toggle_enabled(delay_enable_cb, [random_delay_tf])
+
+
+            # タスク名の上側に余白を設け、開始タイミング行を直下に配置
+            start_row = ft.Row([sd_tf, sd_pick_btn, st_tf, start_utc_cb], spacing=8)
 
             content = ft.Container(
                 width=920,
                 height=620,
                 content=ft.Column([
                     # ローディングは無し
-                    schedule_name_tf,
+                    ft.Container(content=schedule_name_tf, margin=ft.margin.only(top=8)),
+                    start_row,
                     ft.Text(f"対象: {alias}", color=ft.colors.GREY),
                     ft.Divider(),
                     ft.Text("適用する種類を選択", color=ft.colors.GREY),
                     schedule_type_dd,
                     sec_daily,
-                    sec_min,
                     sec_hour,
                     sec_week,
                     sec_month,
                     sec_once,
                     ft.Divider(),
+                    ft.Text("詳細設定", color=ft.colors.GREY, size=20),
                     options_group,
                 ], tight=True, spacing=8, scroll=ft.ScrollMode.ALWAYS),
             )
@@ -620,40 +652,43 @@ class AliasTabUI:
                 typ = schedule_type_dd.value
                 # 終了時刻は任意（繰り返し設定は下で別途検証）
                 # 繰り返しの整合性（/RI 使用時は /DU が必須）
+                rep_enabled = bool(rep_enable_cb.value)
                 rep_iv = (rep_interval_tf.value or '').strip()
                 rep_du = (rep_duration_tf.value or '').strip()
-                rep_interval_val = int(rep_iv) if rep_iv.isdigit() and int(rep_iv) > 0 else None
-                if rep_interval_val is not None and not rep_du:
+                rep_interval_val = int(rep_iv) if (rep_enabled and rep_iv.isdigit() and int(rep_iv) > 0) else None
+                if rep_enabled and rep_interval_val is not None and not rep_du:
                     _show_error(self.page, "繰り返し起動を使う場合は継続時間も入力してください")
                     return
                 # ランダム遅延・UTC・終了時停止
                 rd_str = (random_delay_tf.value or '').strip()
-                random_delay_val = int(rd_str) if rd_str.isdigit() and int(rd_str) > 0 else None
+                random_delay_val = int(rd_str) if (bool(delay_enable_cb.value) and rd_str.isdigit() and int(rd_str) > 0) else None
                 # どちらか一方でもチェックでUTC適用（schtasksの仕様上トリガ単位）
                 utc_val = bool(start_utc_cb.value) or bool(end_utc_cb.value)
-                stop_at_end_val = bool(stop_at_end_cb.value)
+                stop_at_end_val = bool(stop_at_end_cb.value) if rep_enabled else False
                 # 期間ウィンドウ（チェック有効時のみ適用）
-                sd_val = (sd_tf.value or '').strip() if start_enable_cb.value else None
-                st_val = (st_tf.value or '').strip() if start_enable_cb.value else None
+                sd_val = (sd_tf.value or '').strip() or None
+                st_val = (st_tf.value or '').strip() or None
                 ed_val = (ed_tf.value or '').strip() if end_enable_cb.value else None
                 et_val = (et_tf.value or '').strip() if end_enable_cb.value else None
                 du_val = (du_tf.value or '').strip() if du_enable_cb.value else None
 
                 # 毎日
                 if typ == "DAILY":
-                    hhmm = (st_val or (daily_tf.value or '').strip())
+                    hhmm = (st_val or '')
                     if not hhmm:
                         errors.append("毎日: 時刻を入力してください")
                     else:
                         try:
                             scheduler.create_daily_task(
-                                alias, path, hhmm,
+                                alias,
+                                path,
+                                hhmm,
                                 sd=sd_val,
                                 ed=ed_val,
                                 et=et_val,
                                 du=du_val,
                                 rep_interval_min=rep_interval_val,
-                                rep_duration=(rep_du or None),
+                                rep_duration=(rep_du or None) if rep_enabled else None,
                                 stop_at_rep_end=stop_at_end_val,
                                 random_delay_minutes=random_delay_val,
                                 utc=utc_val,
@@ -662,32 +697,11 @@ class AliasTabUI:
                             )
                         except Exception as ex:
                             errors.append(f"毎日: {ex}")
-                # 毎分
-                if typ == "MIN":
-                    try:
-                        every = int((min_every.value or '0').strip())
-                        st = (st_val or (min_start.value or '').strip())
-                        scheduler.create_minutely_task(
-                            alias, path, every, st,
-                            sd=sd_val,
-                            ed=ed_val,
-                            et=et_val,
-                            du=du_val,
-                            rep_interval_min=rep_interval_val,
-                            rep_duration=(rep_du or None),
-                            stop_at_rep_end=stop_at_end_val,
-                            random_delay_minutes=random_delay_val,
-                            utc=utc_val,
-                            elevated=elevated,
-                            task_name=((schedule_name_tf.value or '').strip() or None),
-                        )
-                    except Exception as ex:
-                        errors.append(f"毎分: {ex}")
                 # 毎時
                 if typ == "HOUR":
                     try:
                         every = int((hr_every.value or '0').strip())
-                        st = (st_val or (hr_start.value or '').strip())
+                        st = (st_val or '')
                         scheduler.create_hourly_task(
                             alias, path, every, st,
                             sd=sd_val,
@@ -695,7 +709,7 @@ class AliasTabUI:
                             et=et_val,
                             du=du_val,
                             rep_interval_min=rep_interval_val,
-                            rep_duration=(rep_du or None),
+                            rep_duration=(rep_du or None) if rep_enabled else None,
                             stop_at_rep_end=stop_at_end_val,
                             random_delay_minutes=random_delay_val,
                             utc=utc_val,
@@ -713,16 +727,16 @@ class AliasTabUI:
                         days = [jp_to_en.get(d, d) for d in sel_days]
                         if not days:
                             raise ValueError("曜日を1つ以上選択してください")
-                        if not (st_val or (weekly_time.value or '').strip()):
+                        if not (st_val or ''):
                             raise ValueError("時刻を入力してください")
                         scheduler.create_weekly_task(
-                            alias, path, (st_val or weekly_time.value.strip()), days, interval,
+                            alias, path, (st_val or ''), days, interval,
                             sd=sd_val,
                             ed=ed_val,
                             et=et_val,
                             du=du_val,
                             rep_interval_min=rep_interval_val,
-                            rep_duration=(rep_du or None),
+                            rep_duration=(rep_du or None) if rep_enabled else None,
                             stop_at_rep_end=stop_at_end_val,
                             random_delay_minutes=random_delay_val,
                             utc=utc_val,
@@ -738,13 +752,13 @@ class AliasTabUI:
                         m = [x.strip() for x in (monthly_months.value or '').split(',') if x.strip()] if (monthly_months.value or '').strip() else None
                         interval = int((monthly_interval.value or '1').strip() or '1')
                         scheduler.create_monthly_task(
-                            alias, path, (st_val or monthly_time.value.strip()), d, m, interval,
+                            alias, path, (st_val or ''), d, m, interval,
                             sd=sd_val,
                             ed=ed_val,
                             et=et_val,
                             du=du_val,
                             rep_interval_min=rep_interval_val,
-                            rep_duration=(rep_du or None),
+                            rep_duration=(rep_du or None) if rep_enabled else None,
                             stop_at_rep_end=stop_at_end_val,
                             random_delay_minutes=random_delay_val,
                             utc=utc_val,
@@ -756,7 +770,7 @@ class AliasTabUI:
                 # 1回
                 if typ == "ONCE":
                     od = (once_date.value or '').strip()
-                    ot = (st_val or (once_time.value or '').strip())
+                    ot = (st_val or '')
                     if od and ot:
                         try:
                             scheduler.create_once_task(
@@ -802,7 +816,7 @@ class AliasTabUI:
                         pass
 
             # Enterで保存
-            for tf in [daily_tf, min_every, min_start, hr_every, hr_start, weekly_time, weekly_interval, monthly_time, monthly_days, monthly_months, monthly_interval, once_date, once_time, sd_tf, ed_tf, et_tf, st_tf, du_tf, rep_interval_tf, rep_duration_tf, random_delay_tf, idle_tf2]:
+            for tf in [hr_every, weekly_interval, monthly_days, monthly_months, monthly_interval, once_date, sd_tf, ed_tf, et_tf, st_tf, du_tf, rep_interval_tf, rep_duration_tf, random_delay_tf, idle_tf2]:
                 try:
                     tf.on_submit = save_all
                     tf.on_change = _maybe_set_default_name
@@ -922,20 +936,48 @@ class AliasTabUI:
     def _launch(self, path: str, run_as_admin: bool = False):
         try:
             lp = (path or "").lower()
-            # 管理者要求時は拡張子に関係なく ShellExecuteW("runas") を優先
+            # URL は常に既定ブラウザで開く
+            if lp.endswith('.url') or lp.startswith('http://') or lp.startswith('https://'):
+                try:
+                    os.startfile(path)  # type: ignore[attr-defined]
+                    return
+                except Exception as e:
+                    _show_error(self.page, f"URL の起動に失敗しました: {e}")
+                    return
+
+            # Windows ショートカットの解決
+            target = path
+            params = ""
+            workdir: Optional[str] = None
+            if lp.endswith('.lnk'):
+                target, params, workdir = _resolve_windows_shortcut(path)
+                lp = (target or "").lower()
+
+            # 管理者要求時は ShellExecuteW("runas") を使う
             if run_as_admin and os.name == 'nt':
                 try:
-                    ctypes.windll.shell32.ShellExecuteW(None, "runas", path, None, None, 1)
+                    _shell_execute_runas(target, params, workdir)
                     return
-                except Exception:
-                    pass
-            if lp.endswith(".lnk") or lp.endswith(".url"):
-                # ショートカット/URL は Shell 経由で開く
-                os.startfile(path)  # type: ignore[attr-defined]
+                except Exception as e:
+                    # フォールバック: 普通に起動しエラー表示
+                    _show_error(self.page, f"管理者としての起動に失敗しました: {e}")
+                    return
+
+            # 通常起動
+            if params:
+                # 引数付きの場合は Popen で引数を分割して起動
+                subprocess.Popen([target, *shlex.split(params, posix=False)], cwd=workdir or None, close_fds=True)
             else:
-                subprocess.Popen([path], close_fds=True)
-        except Exception as ex:
-            _show_error(self.page, f"起動に失敗しました: {ex}")
+                if lp.endswith('.exe'):
+                    subprocess.Popen([target], cwd=workdir or None, close_fds=True)
+                else:
+                    # 非 exe（例えば .bat, .cmd）は startfile の方が安定
+                    try:
+                        os.startfile(target)  # type: ignore[attr-defined]
+                    except Exception:
+                        subprocess.Popen([target], cwd=workdir or None, close_fds=True, shell=True)
+        except Exception as e:
+            _show_error(self.page, f"起動に失敗しました: {e}")
 
     def _confirm_remove(self, alias: str):
         def do_remove(_: ft.ControlEvent):
@@ -1822,7 +1864,6 @@ class ScheduleTabUI:
                                         width=300,
                                         options=[
                                             ft.dropdown.Option("DAILY", "毎日"),
-                                            ft.dropdown.Option("MIN", "毎分"),
                                             ft.dropdown.Option("HOUR", "毎時"),
                                             ft.dropdown.Option("WEEK", "毎週"),
                                             ft.dropdown.Option("MONTH", "毎月"),
@@ -1833,22 +1874,16 @@ class ScheduleTabUI:
                                         ],
                                         value=None,
                                     )
-                                    # 共通フィールド
-                                    daily_tf = ft.TextField(label="時刻 HH:MM", width=140)
-                                    min_every = ft.TextField(label="間隔(分)", width=140)
-                                    min_start = ft.TextField(label="開始時刻 HH:MM", width=160)
+                                    # 共通フィールド（開始時刻は統一）
+                                    st_tf = ft.TextField(label="開始時刻 HH:MM", width=160)
                                     hr_every = ft.TextField(label="間隔(時間)", width=160)
-                                    hr_start = ft.TextField(label="開始時刻 HH:MM", width=160)
-                                    weekly_time = ft.TextField(label="時刻 HH:MM", width=160)
                                     weekly_interval = ft.TextField(label="間隔(週)", width=120)
                                     wd_labels = ["月","火","水","木","金","土","日"]
                                     wd_check: list[ft.Checkbox] = [ft.Checkbox(label=l, value=False) for l in wd_labels]
-                                    monthly_time = ft.TextField(label="時刻 HH:MM", width=160)
                                     monthly_days = ft.TextField(label="日付 (例: 1,15,LAST)", width=240)
                                     monthly_months = ft.TextField(label="対象月 (例: 1,2,3)", width=240)
                                     monthly_interval = ft.TextField(label="間隔(月)", width=120)
                                     once_date = ft.TextField(label="日付 YYYY/MM/DD", width=180)
-                                    once_time = ft.TextField(label="時刻 HH:MM", width=140)
                                     # ONCE用カレンダー
                                     once_pick_btn = ft.IconButton(ft.icons.CALENDAR_MONTH, tooltip="カレンダーから選択", on_click=lambda e: _open_dp(once_date))
                                     sd_tf = ft.TextField(label="開始日 YYYY/MM/DD", width=190)
@@ -1857,15 +1892,16 @@ class ScheduleTabUI:
                                     rep_interval_tf = ft.TextField(label="起動の間隔(分)", width=180)
                                     rep_duration_tf = ft.TextField(label="継続時間 HHH:MM", width=220)
                                     random_delay_tf = ft.TextField(label="遅延（ランダム）(分)", width=180, tooltip="例 60")
-                                    # 期間（編集）：開始/終了のマスターとUTC、停止までの時間
-                                    start_enable_cb = ft.Checkbox(label="開始タイミングを有効", value=False)
-                                    st_tf = ft.TextField(label="開始時刻 HH:MM", width=160, disabled=not start_enable_cb.value)
-                                    start_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False, disabled=not start_enable_cb.value)
+                                    # 期間（編集）：開始は常に有効（UI統一）
+                                    start_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False)
                                     end_enable_cb = ft.Checkbox(label="終了タイミングを有効", value=False)
                                     end_utc_cb = ft.Checkbox(label="タイムゾーン間で同期", value=False, disabled=not end_enable_cb.value)
                                     du_enable_cb = ft.Checkbox(label="停止するまでの時間を有効", value=False)
                                     du_tf = ft.TextField(label="停止するまでの時間 HHH:MM", width=220, disabled=not du_enable_cb.value)
                                     stop_at_end_cb = ft.Checkbox(label="繰り返し継続時間の最後に実行中のすべてのタスクを停止する", value=False)
+                                    # セクション有効トグル（繰り返し・遅延）
+                                    rep_enable_cb = ft.Checkbox(label="繰り返し起動を有効", value=False)
+                                    delay_enable_cb = ft.Checkbox(label="遅延時間を有効", value=False)
                                     # Date pickers
                                     def _open_dp(target_tf: ft.TextField):
                                         def _on_change(ev: ft.ControlEvent):
@@ -1901,9 +1937,10 @@ class ScheduleTabUI:
                                             self.page.update()
                                         except Exception:
                                             pass
-                                    start_enable_cb.on_change = lambda e: _toggle_enabled(start_enable_cb, [sd_tf, st_tf, start_utc_cb])
                                     end_enable_cb.on_change = lambda e: _toggle_enabled(end_enable_cb, [ed_tf, et_tf, end_utc_cb])
                                     du_enable_cb.on_change = lambda e: _toggle_enabled(du_enable_cb, [du_tf])
+                                    rep_enable_cb.on_change = lambda e: _toggle_enabled(rep_enable_cb, [rep_interval_tf, rep_duration_tf, stop_at_end_cb])
+                                    delay_enable_cb.on_change = lambda e: _toggle_enabled(delay_enable_cb, [random_delay_tf])
                                     # アイドル分は削除（保存時は既存値か既定値を使用）
                                     # 現在設定の反映
                                     kind = (details.get('Kind') or '').upper()
@@ -1911,20 +1948,22 @@ class ScheduleTabUI:
                                     sdate = details.get('StartDate') or ''
                                     edate = details.get('EndDate') or ''
                                     if stime:
-                                        daily_tf.value = stime
-                                        min_start.value = stime
-                                        hr_start.value = stime
-                                        weekly_time.value = stime
-                                        monthly_time.value = stime
-                                        once_time.value = stime
+                                        st_tf.value = stime
                                     if sdate:
                                         sd_tf.value = sdate
                                         if kind == 'ONCE':
                                             once_date.value = sdate
                                     if edate:
                                         ed_tf.value = edate
+                                        # 終了タイミングの有効判定（終了日がある場合にON）
+                                        end_enable_cb.value = True
+                                        # 終了時刻（存在する場合）
+                                        et = details.get('EndTime') or ''
+                                        if et:
+                                            et_tf.value = et
                                     if kind == 'MINUTE' and details.get('EveryMinutes'):
-                                        min_every.value = str(details['EveryMinutes'])
+                                        # 毎分は繰り返し間隔(分)として扱う
+                                        rep_interval_tf.value = str(details['EveryMinutes'])
                                     if kind == 'HOURLY' and details.get('EveryHours'):
                                         hr_every.value = str(details['EveryHours'])
                                     if kind == 'WEEKLY' and details.get('Days'):
@@ -1948,32 +1987,47 @@ class ScheduleTabUI:
                                             rep_interval_tf.value = str(int(details['RepeatIntervalMinutes']))
                                         except Exception:
                                             pass
+                                        rep_enable_cb.value = True
                                     if details.get('RepeatDuration'):
                                         rep_duration_tf.value = str(details['RepeatDuration'])
+                                        rep_enable_cb.value = True
                                     if details.get('RandomDelayMinutes'):
                                         try:
                                             random_delay_tf.value = str(int(details['RandomDelayMinutes']))
                                         except Exception:
                                             pass
+                                        delay_enable_cb.value = True
                                     if details.get('StopAtDurationEnd') is not None:
                                         try:
                                             stop_at_end_cb.value = bool(details['StopAtDurationEnd'])
                                         except Exception:
                                             pass
-                                    # Utcは開始/終了の個別チェックに反映する仕様だが、XMLからの厳密判定は困難なため初期値は未設定
+                                    # 期間ウィンドウの継続時間（停止するまでの時間）が推定できる場合
+                                    if details.get('WindowDuration'):
+                                        du_tf.value = str(details['WindowDuration'])
+                                        du_enable_cb.value = True
+                                    # UTC の反映（StartBoundaryのZを検出済み）
+                                    if details.get('Utc'):
+                                        start_utc_cb.value = True
+                                        # 終了がある場合は終了側にも合わせる
+                                        if bool(end_enable_cb.value):
+                                            end_utc_cb.value = True
 
-                                    # セクション
-                                    sec_daily = ft.Container(content=ft.Row([daily_tf], spacing=8), visible=False)
-                                    sec_min = ft.Container(content=ft.Row([min_every, min_start], spacing=8), visible=False)
-                                    sec_hour = ft.Container(content=ft.Row([hr_every, hr_start], spacing=8), visible=False)
-                                    sec_week = ft.Container(content=ft.Column([ft.Row([weekly_time, weekly_interval], spacing=8), ft.Row(wd_check, spacing=8)], spacing=8), visible=False)
-                                    sec_month = ft.Container(content=ft.Column([ft.Row([monthly_time, monthly_interval], spacing=8), ft.Row([monthly_days, monthly_months], spacing=8)], spacing=8), visible=False)
-                                    sec_once = ft.Container(content=ft.Row([once_date, once_pick_btn, once_time], spacing=8), visible=False)
+                                    # セクション（開始時刻は上段の共通行に統一。セクション内からは削除）
+                                    sec_daily = ft.Container(content=ft.Row([], spacing=8), visible=False)
+                                    sec_hour = ft.Container(content=ft.Row([hr_every], spacing=8), visible=False)
+                                    sec_week = ft.Container(content=ft.Column([ft.Row([weekly_interval], spacing=8), ft.Row(wd_check, spacing=8)], spacing=8), visible=False)
+                                    sec_month = ft.Container(content=ft.Column([ft.Row([monthly_interval], spacing=8), ft.Row([monthly_days, monthly_months], spacing=8)], spacing=8), visible=False)
+                                    sec_once = ft.Container(content=ft.Row([once_date, once_pick_btn], spacing=8), visible=False)
+                                    # 初期トグル状態適用（details で value をセットした後に反映）
+                                    _toggle_enabled(end_enable_cb, [ed_tf, et_tf, end_utc_cb])
+                                    _toggle_enabled(du_enable_cb, [du_tf])
+                                    _toggle_enabled(rep_enable_cb, [rep_interval_tf, rep_duration_tf, stop_at_end_cb])
+                                    _toggle_enabled(delay_enable_cb, [random_delay_tf])
 
                                     def _update_sections(_: Optional[ft.ControlEvent] = None):
                                         typ = schedule_type_dd.value
                                         sec_daily.visible = typ == "DAILY"
-                                        sec_min.visible = typ == "MIN"
                                         sec_hour.visible = typ == "HOUR"
                                         sec_week.visible = typ == "WEEK"
                                         sec_month.visible = typ == "MONTH"
@@ -1982,8 +2036,8 @@ class ScheduleTabUI:
 
                                     # 初期選択
                                     schedule_type_dd.value = {
-                                        'DAILY':'DAILY','MINUTE':'MIN','HOURLY':'HOUR','WEEKLY':'WEEK','MONTHLY':'MONTH','ONCE':'ONCE','ONLOGON':'LOGON','ONSTART':'ONSTART','ONIDLE':'ONIDLE'
-                                    }.get(kind or 'DAILY', 'DAILY')
+                                        'DAILY':'DAILY','MINUTE':'DAILY','HOURLY':'HOUR','WEEKLY':'WEEK','MONTHLY':'MONTH','ONCE':'ONCE','ONLOGON':'LOGON','ONSTART':'ONSTART','ONIDLE':'ONIDLE'
+                                    }.get((kind or 'DAILY').upper(), 'DAILY')
                                     schedule_type_dd.on_change = _update_sections
                                     _update_sections()
 
@@ -1993,21 +2047,22 @@ class ScheduleTabUI:
                                         if not new_name:
                                             _show_error(self.page, "タスク名を入力してください")
                                             return
-                                        # 繰り返しの整合性
+                                        # 繰り返しの整合性（有効時のみ）
+                                        rep_enabled = bool(rep_enable_cb.value)
                                         rep_iv = (rep_interval_tf.value or '').strip()
                                         rep_du = (rep_duration_tf.value or '').strip()
-                                        rep_interval_val = int(rep_iv) if rep_iv.isdigit() and int(rep_iv) > 0 else None
-                                        if rep_interval_val is not None and not rep_du:
+                                        rep_interval_val = int(rep_iv) if (rep_enabled and rep_iv.isdigit() and int(rep_iv) > 0) else None
+                                        if rep_enabled and rep_interval_val is not None and not rep_du:
                                             _show_error(self.page, "繰り返し起動を使う場合は継続時間も入力してください")
                                             return
                                         # ランダム遅延/UTC/終了時停止
                                         rd_str = (random_delay_tf.value or '').strip()
-                                        random_delay_val = int(rd_str) if rd_str.isdigit() and int(rd_str) > 0 else None
+                                        random_delay_val = int(rd_str) if (bool(delay_enable_cb.value) and rd_str.isdigit() and int(rd_str) > 0) else None
                                         utc_val = bool(start_utc_cb.value) or bool(end_utc_cb.value)
-                                        stop_at_end_val = bool(stop_at_end_cb.value)
+                                        stop_at_end_val = bool(stop_at_end_cb.value) if rep_enabled else False
                                         # 期間ウィンドウ（チェック有効時のみ）
-                                        sd_val = (sd_tf.value or '').strip() if start_enable_cb.value else None
-                                        st_val = (st_tf.value or '').strip() if start_enable_cb.value else None
+                                        sd_val = (sd_tf.value or '').strip() or None
+                                        st_val = (st_tf.value or '').strip() or None
                                         ed_val = (ed_tf.value or '').strip() if end_enable_cb.value else None
                                         et_val = (et_tf.value or '').strip() if end_enable_cb.value else None
                                         du_val = (du_tf.value or '').strip() if du_enable_cb.value else None
@@ -2019,54 +2074,39 @@ class ScheduleTabUI:
                                                 target = new_name
                                             # 有効/無効
                                             scheduler.change_task_enabled(target, bool(en_sw.value))
-                                            # 種別ごと保存（Authorは内部でShortRunに設定）
-                                            alias = new_name  # 既存APIの都合で alias を流用（名前に基づく）
+                                            # 種別ごと保存
+                                            alias = new_name  # API都合で名前を alias として再利用
                                             exe = details.get('Command') or ''
                                             elevated = bool(settings.load_config().get("run_as_admin", False))
                                             if typ == 'DAILY':
                                                 scheduler.create_daily_task(
-                                                    alias, exe, (st_val or (daily_tf.value or '').strip()),
+                                                    alias, exe, (st_val or ''),
                                                     sd=sd_val,
                                                     ed=ed_val,
                                                     et=et_val,
                                                     du=du_val,
                                                     rep_interval_min=rep_interval_val,
-                                                    rep_duration=(rep_du or None),
+                                                    rep_duration=(rep_du or None) if rep_enabled else None,
                                                     stop_at_rep_end=stop_at_end_val,
                                                     random_delay_minutes=random_delay_val,
                                                     utc=utc_val,
                                                     elevated=elevated,
-                                                    task_name=target
-                                                )
-                                            elif typ == 'MIN':
-                                                scheduler.create_minutely_task(
-                                                    alias, exe, int((min_every.value or '1').strip() or '1'), (st_val or (min_start.value or '').strip()),
-                                                    sd=sd_val,
-                                                    ed=ed_val,
-                                                    et=et_val,
-                                                    du=du_val,
-                                                    rep_interval_min=rep_interval_val,
-                                                    rep_duration=(rep_du or None),
-                                                    stop_at_rep_end=stop_at_end_val,
-                                                    random_delay_minutes=random_delay_val,
-                                                    utc=utc_val,
-                                                    elevated=elevated,
-                                                    task_name=target
+                                                    task_name=target,
                                                 )
                                             elif typ == 'HOUR':
                                                 scheduler.create_hourly_task(
-                                                    alias, exe, int((hr_every.value or '1').strip() or '1'), (st_val or (hr_start.value or '').strip()),
+                                                    alias, exe, int((hr_every.value or '1').strip() or '1'), (st_val or ''),
                                                     sd=sd_val,
                                                     ed=ed_val,
                                                     et=et_val,
                                                     du=du_val,
                                                     rep_interval_min=rep_interval_val,
-                                                    rep_duration=(rep_du or None),
+                                                    rep_duration=(rep_du or None) if rep_enabled else None,
                                                     stop_at_rep_end=stop_at_end_val,
                                                     random_delay_minutes=random_delay_val,
                                                     utc=utc_val,
                                                     elevated=elevated,
-                                                    task_name=target
+                                                    task_name=target,
                                                 )
                                             elif typ == 'WEEK':
                                                 jp_to_en = {"月":"MON","火":"TUE","水":"WED","木":"THU","金":"FRI","土":"SAT","日":"SUN"}
@@ -2074,43 +2114,43 @@ class ScheduleTabUI:
                                                 if not days:
                                                     raise ValueError("曜日を1つ以上選択してください")
                                                 scheduler.create_weekly_task(
-                                                    alias, exe, (st_val or (weekly_time.value or '').strip()), days, int((weekly_interval.value or '1').strip() or '1'),
+                                                    alias, exe, (st_val or ''), days, int((weekly_interval.value or '1').strip() or '1'),
                                                     sd=sd_val,
                                                     ed=ed_val,
                                                     et=et_val,
                                                     du=du_val,
                                                     rep_interval_min=rep_interval_val,
-                                                    rep_duration=(rep_du or None),
+                                                    rep_duration=(rep_du or None) if rep_enabled else None,
                                                     stop_at_rep_end=stop_at_end_val,
                                                     random_delay_minutes=random_delay_val,
                                                     utc=utc_val,
                                                     elevated=elevated,
-                                                    task_name=target
+                                                    task_name=target,
                                                 )
                                             elif typ == 'MONTH':
                                                 d = [x.strip() for x in (monthly_days.value or '').split(',') if x.strip()]
                                                 m = [x.strip() for x in (monthly_months.value or '').split(',') if x.strip()] if (monthly_months.value or '').strip() else None
                                                 scheduler.create_monthly_task(
-                                                    alias, exe, (st_val or (monthly_time.value or '').strip()), d, m, int((monthly_interval.value or '1').strip() or '1'),
+                                                    alias, exe, (st_val or ''), d, m, int((monthly_interval.value or '1').strip() or '1'),
                                                     sd=sd_val,
                                                     ed=ed_val,
                                                     et=et_val,
                                                     du=du_val,
                                                     rep_interval_min=rep_interval_val,
-                                                    rep_duration=(rep_du or None),
+                                                    rep_duration=(rep_du or None) if rep_enabled else None,
                                                     stop_at_rep_end=stop_at_end_val,
                                                     random_delay_minutes=random_delay_val,
                                                     utc=utc_val,
                                                     elevated=elevated,
-                                                    task_name=target
+                                                    task_name=target,
                                                 )
                                             elif typ == 'ONCE':
                                                 scheduler.create_once_task(
-                                                    alias, exe, (once_date.value or '').strip(), (st_val or (once_time.value or '').strip()),
+                                                    alias, exe, (once_date.value or '').strip(), (st_val or ''),
                                                     random_delay_minutes=random_delay_val,
                                                     utc=utc_val,
                                                     elevated=elevated,
-                                                    task_name=target
+                                                    task_name=target,
                                                 )
                                             elif typ == 'LOGON':
                                                 scheduler.ensure_logon_task(alias, exe, True, elevated=elevated, task_name=target)
@@ -2132,31 +2172,45 @@ class ScheduleTabUI:
                                             width=860,
                                             height=560,
                                             content=ft.Column([
-                                                name_tf,
+                                                ft.Container(content=name_tf, margin=ft.margin.only(top=8)),
                                                 en_sw,
+                                                ft.Row([sd_tf, sd_pick_btn, st_tf, start_utc_cb], spacing=8),
                                                 schedule_type_dd,
                                                 sec_daily,
-                                                sec_min,
                                                 sec_hour,
                                                 sec_week,
                                                 sec_month,
                                                 sec_once,
                                                 ft.Divider(),
-                                                ft.Text("期間指定", color=ft.colors.GREY),
-                                                ft.Row([start_enable_cb, sd_tf, sd_pick_btn, st_tf, start_utc_cb], spacing=8),
-                                                ft.Row([end_enable_cb, ed_tf, ed_pick_btn, et_tf, end_utc_cb], spacing=8),
-                                                ft.Row([du_enable_cb, du_tf], spacing=8),
-                                                ft.Text("繰り返し起動する", color=ft.colors.GREY),
+                                                ft.Text("詳細設定", color=ft.colors.GREY, size=20),
                                                 ft.Container(
-                                                    content=ft.Row([
-                                                        rep_interval_tf,
-                                                        rep_duration_tf,
-                                                    ], spacing=8),
+                                                    content=ft.Column([
+                                                        # 期間指定
+                                                        ft.Column([
+                                                            ft.Row([ft.Text("期間指定", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([end_enable_cb, ed_tf, ed_pick_btn, et_tf, end_utc_cb], spacing=8),
+                                                        ], spacing=8),
+                                                        # 停止時間
+                                                        ft.Column([
+                                                            ft.Row([ft.Text("停止時間", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([du_enable_cb], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([du_tf], spacing=8),
+                                                        ], spacing=8),
+                                                        # 繰り返し起動
+                                                        ft.Column([
+                                                            ft.Row([ft.Text("繰り返し起動", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([rep_enable_cb], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([rep_interval_tf, rep_duration_tf], spacing=8),
+                                                            ft.Row([stop_at_end_cb], spacing=8),
+                                                        ], spacing=8),
+                                                        # 遅延時間
+                                                        ft.Column([
+                                                            ft.Row([ft.Text("遅延時間（一定時間待機してから起動）", color=ft.colors.GREY)], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([delay_enable_cb], alignment=ft.MainAxisAlignment.START),
+                                                            ft.Row([random_delay_tf], spacing=8),
+                                                        ], spacing=8),
+                                                    ], spacing=12),
                                                 ),
-                                                ft.Divider(),
-                                                ft.Text("その他の詳細設定", color=ft.colors.GREY),
-                                                ft.Row([random_delay_tf], spacing=12),
-                                                ft.Row([stop_at_end_cb], spacing=12),
                                             ], spacing=8, tight=True, scroll=ft.ScrollMode.ALWAYS),
                                         ),
                                         actions=[

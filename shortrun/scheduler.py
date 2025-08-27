@@ -728,9 +728,11 @@ def _set_trigger_delay_minutes(task_name: str, minutes: int, *, kind: str) -> No
 
 def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
     """Return best-effort parsed details of a task from its XML.
-    Keys: Kind, StartTime, EveryMinutes, EveryHours, Days, WeeksInterval,
+    Keys: Kind, StartTime, EndTime, EveryMinutes, EveryHours, Days, WeeksInterval,
           Months, MonthsInterval, OnceDate, StartDate, EndDate,
-          Enabled, Command, Arguments.
+          Enabled, Command, Arguments, IdleMinutes, RepeatIntervalMinutes,
+          RepeatDuration, RandomDelayMinutes, StopAtDurationEnd, Utc,
+          WindowDuration.
     Values may be None if not applicable.
     """
     try:
@@ -741,6 +743,7 @@ def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
         out: Dict[str, Optional[object]] = {
             'Kind': None,
             'StartTime': None,
+            'EndTime': None,
             'EveryMinutes': None,
             'EveryHours': None,
             'Days': None,
@@ -759,6 +762,7 @@ def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
             'RandomDelayMinutes': None,
             'StopAtDurationEnd': None,
             'Utc': None,
+            'WindowDuration': None,
         }
 
         def _get(tag: str) -> Optional[str]:
@@ -792,6 +796,16 @@ def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
                 return f"{hh}:{mm}"
             except Exception:
                 return ''
+        def _parse_dt(s: str) -> Optional[dt.datetime]:
+            try:
+                # Remove trailing Z if present; ignore timezone for duration calc
+                s2 = s.rstrip('Z')
+                # Expect seconds present; if missing, pad
+                if len(s2.split('T', 1)[1].split(':')) == 2:
+                    s2 = s2 + ":00"
+                return dt.datetime.strptime(s2, "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return None
         if sb:
             out['StartDate'] = _ymd(sb)
             out['StartTime'] = _hm(sb)
@@ -800,6 +814,16 @@ def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
                 out['Utc'] = True
         if eb:
             out['EndDate'] = _ymd(eb)
+            out['EndTime'] = _hm(eb)
+        # Derive window duration if both boundaries exist
+        if sb and eb:
+            ds = _parse_dt(sb)
+            de = _parse_dt(eb)
+            if ds and de and de > ds:
+                delta = de - ds
+                hours = delta.days * 24 + delta.seconds // 3600
+                mins = (delta.seconds % 3600) // 60
+                out['WindowDuration'] = f"{hours}:{mins:02d}"
 
         # Quick kind checks
         if re.search(r"<LogonTrigger>", xml):
