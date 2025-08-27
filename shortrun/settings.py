@@ -27,6 +27,7 @@ _DEFAULTS: Dict[str, Any] = {
     "theme": "system",  # system | light | dark
     "last_tab": 0,
     "show_uninstallers": False,
+    "run_as_admin": False,
 }
 
 
@@ -79,5 +80,13 @@ def set_last_tab(cfg: Dict[str, Any], index: int) -> Dict[str, Any]:
 def set_show_uninstallers(cfg: Dict[str, Any], show: bool) -> Dict[str, Any]:
     cfg = dict(cfg)
     cfg["show_uninstallers"] = bool(show)
+    save_config(cfg)
+    return cfg
+
+
+def set_run_as_admin(cfg: Dict[str, Any], run_as_admin: bool) -> Dict[str, Any]:
+    """グローバル既定の「管理者として実行」設定を保存する。"""
+    cfg = dict(cfg)
+    cfg["run_as_admin"] = bool(run_as_admin)
     save_config(cfg)
     return cfg

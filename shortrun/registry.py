@@ -16,6 +16,8 @@ _alias_re = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 class AliasEntry:
     alias: str
     exe_path: str
+    # ShortRun 専用の付加情報
+    run_as_admin: bool = False
     comment: Optional[str] = None
 
 
@@ -61,8 +63,19 @@ def list_aliases() -> List[AliasEntry]:
                             exe_path, _ = winreg.QueryValueEx(sk, None)
                         except FileNotFoundError:
                             continue
+                        # 追加フラグ（存在しない場合は False）
+                        run_admin = False
+                        try:
+                            ra, _ = winreg.QueryValueEx(sk, "RunAsAdmin")
+                            # REG_SZ/REG_DWORD いずれも受け入れる
+                            if isinstance(ra, int):
+                                run_admin = bool(ra)
+                            else:
+                                run_admin = str(ra).strip().lower() in ("1", "true", "yes")
+                        except FileNotFoundError:
+                            run_admin = False
                         alias = name[:-4] if name.lower().endswith(".exe") else name
-                        entries.append(AliasEntry(alias=alias, exe_path=exe_path))
+                        entries.append(AliasEntry(alias=alias, exe_path=exe_path, run_as_admin=run_admin))
                 except OSError:
                     continue
             return entries
@@ -82,7 +95,17 @@ def get_alias(alias: str) -> Optional[AliasEntry]:
                 except FileNotFoundError:
                     return None
                 exe_path, _ = winreg.QueryValueEx(sk, None)
-                return AliasEntry(alias=alias, exe_path=exe_path)
+                # 追加フラグ（存在しない場合は False）
+                run_admin = False
+                try:
+                    ra, _ = winreg.QueryValueEx(sk, "RunAsAdmin")
+                    if isinstance(ra, int):
+                        run_admin = bool(ra)
+                    else:
+                        run_admin = str(ra).strip().lower() in ("1", "true", "yes")
+                except FileNotFoundError:
+                    run_admin = False
+                return AliasEntry(alias=alias, exe_path=exe_path, run_as_admin=run_admin)
     except FileNotFoundError:
         return None
 
@@ -117,8 +140,16 @@ def add_alias(alias: str, exe_path: str, overwrite: bool = False) -> AliasEntry:
         winreg.SetValueEx(sk, None, 0, winreg.REG_SZ, exe_path)
         winreg.SetValueEx(sk, "Path", 0, winreg.REG_SZ, os.path.dirname(exe_path))
         winreg.SetValueEx(sk, MARKER_NAME, 0, winreg.REG_SZ, MARKER_VALUE)
+        # 既定は管理者権限で実行しない
+        try:
+            winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_DWORD, 0)
+        except Exception:
+            try:
+                winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_SZ, "0")
+            except Exception:
+                pass
 
-    return AliasEntry(alias=alias, exe_path=exe_path)
+    return AliasEntry(alias=alias, exe_path=exe_path, run_as_admin=False)
 
 
 def remove_alias(alias: str) -> None:
@@ -156,7 +187,17 @@ def update_alias(old_alias: str, new_alias: str, new_exe_path: str, overwrite: b
             winreg.SetValueEx(sk, None, 0, winreg.REG_SZ, new_exe_path)
             winreg.SetValueEx(sk, "Path", 0, winreg.REG_SZ, os.path.dirname(new_exe_path))
             winreg.SetValueEx(sk, MARKER_NAME, 0, winreg.REG_SZ, MARKER_VALUE)
-        return AliasEntry(alias=new_alias, exe_path=new_exe_path)
+        # RunAsAdmin は既存値を温存
+        run_admin = False
+        try:
+            ra, _ = winreg.QueryValueEx(sk, "RunAsAdmin")
+            if isinstance(ra, int):
+                run_admin = bool(ra)
+            else:
+                run_admin = str(ra).strip().lower() in ("1", "true", "yes")
+        except Exception:
+            run_admin = False
+        return AliasEntry(alias=new_alias, exe_path=new_exe_path, run_as_admin=run_admin)
 
     # alias が変わる場合
     # 既存 new_alias の有無確認
@@ -169,7 +210,27 @@ def update_alias(old_alias: str, new_alias: str, new_exe_path: str, overwrite: b
         winreg.SetValueEx(sk, None, 0, winreg.REG_SZ, new_exe_path)
         winreg.SetValueEx(sk, "Path", 0, winreg.REG_SZ, os.path.dirname(new_exe_path))
         winreg.SetValueEx(sk, MARKER_NAME, 0, winreg.REG_SZ, MARKER_VALUE)
+        try:
+            winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_DWORD, 0)
+        except Exception:
+            try:
+                winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_SZ, "0")
+            except Exception:
+                pass
 
     # 旧キー削除（ShortRun フラグ確認の上）
     remove_alias(old_alias)
-    return AliasEntry(alias=new_alias, exe_path=new_exe_path)
+    return AliasEntry(alias=new_alias, exe_path=new_exe_path, run_as_admin=False)
+
+
+def set_run_as_admin(alias: str, run_as_admin: bool) -> None:
+    """エイリアスに対して「管理者として実行」フラグを設定する。"""
+    name = _app_paths_subkey_name(alias)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, os.path.join(APP_PATHS_KEY, name)) as sk:
+        try:
+            winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_DWORD, 1 if run_as_admin else 0)
+        except Exception:
+            try:
+                winreg.SetValueEx(sk, "RunAsAdmin", 0, winreg.REG_SZ, "1" if run_as_admin else "0")
+            except Exception:
+                pass
