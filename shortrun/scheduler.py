@@ -131,6 +131,100 @@ def _append_schedule_window(cmd: List[str], *, sd: Optional[str] = None, ed: Opt
             cmd.extend(["/DU", du])
 
 
+def _append_repetition(cmd: List[str], *, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None) -> None:
+    """任意の繰り返し実行（Repetition）をコマンドへ追加する。
+    - rep_interval_min: 繰り返し間隔(分)
+    - rep_duration: 継続時間 HHH:MM 形式（schtasks の /DU に準拠）
+    注意: /RI を指定する場合、/DU も必要（Task Scheduler の制約）。
+    """
+    if rep_interval_min is not None:
+        try:
+            ival = int(rep_interval_min)
+            if ival >= 1:
+                cmd.extend(["/RI", str(ival)])
+        except Exception:
+            pass
+    if rep_duration:
+        if re.match(r"^\d{1,4}:\d{2}(:\d{2})?$", rep_duration):
+            cmd.extend(["/DU", rep_duration])
+
+
+def _set_calendar_random_delay_minutes(task_name: str, minutes: int) -> None:
+    """Patch task XML to set <RandomDelay> for Calendar(Time) triggers. Best-effort.
+    minutes: total minutes for random delay. Writes PT{minutes}M.
+    """
+    try:
+        if minutes is None or minutes <= 0:
+            return
+        cp = _run(["schtasks", "/Query", "/TN", task_name, "/XML"])
+        if cp.returncode != 0 or not cp.stdout:
+            return
+        xml = cp.stdout
+        # Find CalendarTrigger block
+        pat = re.compile(r"(<CalendarTrigger[^>]*>)(.*?)(</CalendarTrigger>)", flags=re.S)
+        m = pat.search(xml)
+        if not m:
+            # Some schedules might use <TimeTrigger>
+            pat2 = re.compile(r"(<TimeTrigger[^>]*>)(.*?)(</TimeTrigger>)", flags=re.S)
+            m = pat2.search(xml)
+            if not m:
+                return
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        # Replace or insert <RandomDelay>
+        if re.search(r"<RandomDelay>.*?</RandomDelay>", body, flags=re.S):
+            body2 = re.sub(r"<RandomDelay>.*?</RandomDelay>", f"<RandomDelay>PT{minutes}M</RandomDelay>", body)
+        else:
+            # Insert before closing tag, try after <StartBoundary> if exists
+            if "</StartBoundary>" in body:
+                body2 = body.replace("</StartBoundary>", "</StartBoundary><RandomDelay>PT" + str(minutes) + "M</RandomDelay>")
+            else:
+                body2 = body + f"<RandomDelay>PT{minutes}M</RandomDelay>"
+        new_xml = xml[:m.start()] + head + body2 + tail + xml[m.end():]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml", mode="w", encoding="utf-8") as f:
+            f.write(new_xml)
+            tmp = f.name
+        try:
+            _run(["schtasks", "/Create", "/TN", task_name, "/XML", tmp, "/F"])
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _set_repetition_stop_at_end(task_name: str, stop: bool) -> None:
+    """Patch task XML to set <Repetition><StopAtDurationEnd> flag. Best-effort."""
+    try:
+        cp = _run(["schtasks", "/Query", "/TN", task_name, "/XML"])
+        if cp.returncode != 0 or not cp.stdout:
+            return
+        xml = cp.stdout
+        pat = re.compile(r"(<Repetition[^>]*>)(.*?)(</Repetition>)", flags=re.S)
+        m = pat.search(xml)
+        if not m:
+            return
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        if re.search(r"<StopAtDurationEnd>.*?</StopAtDurationEnd>", body, flags=re.S):
+            body2 = re.sub(r"<StopAtDurationEnd>.*?</StopAtDurationEnd>", f"<StopAtDurationEnd>{str(bool(stop)).lower()}</StopAtDurationEnd>", body)
+        else:
+            body2 = body + f"<StopAtDurationEnd>{str(bool(stop)).lower()}</StopAtDurationEnd>"
+        new_xml = xml[:m.start()] + head + body2 + tail + xml[m.end():]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml", mode="w", encoding="utf-8") as f:
+            f.write(new_xml)
+            tmp = f.name
+        try:
+            _run(["schtasks", "/Create", "/TN", task_name, "/XML", tmp, "/F"])
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def list_tasks(alias: Optional[str] = None, *, author: Optional[str] = None) -> List[Dict[str, str]]:
     """タスク一覧を取得。
     - デフォルトは ShortRun_ プレフィックスのタスクのみを対象
@@ -214,7 +308,7 @@ def delete_all_for_alias(alias: str) -> None:
         delete_task_by_simple_name(t['SimpleName'])
 
 
-def ensure_logon_task(alias: str, exe_path: str, enabled: bool, *, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def ensure_logon_task(alias: str, exe_path: str, enabled: bool, *, elevated: bool = False, task_name: Optional[str] = None, delay_minutes: Optional[int] = None) -> None:
     name = _task_name(alias, "LOGON")
     if task_name:
         name = task_name
@@ -233,11 +327,17 @@ def ensure_logon_task(alias: str, exe_path: str, enabled: bool, *, elevated: boo
         if cp.returncode != 0:
             raise RuntimeError(cp.stderr or cp.stdout)
         _ensure_author(name)
+        # 任意: 起動遅延
+        if isinstance(delay_minutes, int) and delay_minutes >= 0:
+            try:
+                _set_trigger_delay_minutes(name, delay_minutes, kind="LOGON")
+            except Exception:
+                pass
     else:
         _run(["schtasks", "/Delete", "/TN", name, "/F"])
 
 
-def create_daily_task(alias: str, exe_path: str, hhmm: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_daily_task(alias: str, exe_path: str, hhmm: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None, stop_at_rep_end: bool = False, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     # hh:mm を想定
     try:
         dt.datetime.strptime(hhmm, "%H:%M")
@@ -255,14 +355,27 @@ def create_daily_task(alias: str, exe_path: str, hhmm: str, *, sd: Optional[str]
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
-    _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    if utc:
+        cmd.append("/Z")
+    # 繰り返しを指定した場合は /DU は繰り返しの継続時間に使用するため、
+    # ウィンドウ用の du は同時に指定しない（競合回避）。
+    if rep_interval_min is None:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    else:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=None)
+        _append_repetition(cmd, rep_interval_min=rep_interval_min, rep_duration=rep_duration)
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    # Post-create patches
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
+    if stop_at_rep_end and rep_interval_min is not None:
+        _set_repetition_stop_at_end(name, True)
 
 
-def create_once_task(alias: str, exe_path: str, date_str: str, hhmm: str, *, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_once_task(alias: str, exe_path: str, date_str: str, hhmm: str, *, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     # date_str: YYYY/MM/DD or YYYY-MM-DD
     date_str = date_str.replace('-', '/')
     try:
@@ -281,10 +394,14 @@ def create_once_task(alias: str, exe_path: str, date_str: str, hhmm: str, *, ele
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
+    if utc:
+        cmd.append("/Z")
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
 
 
 # 追加トリガー群 -----------------------------------------------------------
@@ -296,7 +413,7 @@ def _validate_hhmm(hhmm: str) -> None:
         raise ValueError("時刻は HH:MM 形式で指定してください")
 
 
-def ensure_onstart_task(alias: str, exe_path: str, enabled: bool, *, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def ensure_onstart_task(alias: str, exe_path: str, enabled: bool, *, elevated: bool = False, task_name: Optional[str] = None, delay_minutes: Optional[int] = None) -> None:
     """Windows 起動時（ONSTART）のタスクを有効/無効にする。"""
     name = _task_name(alias, "ONSTART")
     if task_name:
@@ -315,11 +432,17 @@ def ensure_onstart_task(alias: str, exe_path: str, enabled: bool, *, elevated: b
         if cp.returncode != 0:
             raise RuntimeError(cp.stderr or cp.stdout)
         _ensure_author(name)
+        # 任意: 起動遅延
+        if isinstance(delay_minutes, int) and delay_minutes >= 0:
+            try:
+                _set_trigger_delay_minutes(name, delay_minutes, kind="ONSTART")
+            except Exception:
+                pass
     else:
         _run(["schtasks", "/Delete", "/TN", name, "/F"])
 
 
-def create_minutely_task(alias: str, exe_path: str, every_minutes: int, start_time: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_minutely_task(alias: str, exe_path: str, every_minutes: int, start_time: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None, stop_at_rep_end: bool = False, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     """N分おき（MINUTE）。start_time は HH:MM。"""
     if every_minutes < 1 or every_minutes > 1439:
         raise ValueError("分間隔は 1〜1439 の範囲で指定してください")
@@ -336,14 +459,24 @@ def create_minutely_task(alias: str, exe_path: str, every_minutes: int, start_ti
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
-    _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    if utc:
+        cmd.append("/Z")
+    if rep_interval_min is None:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    else:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=None)
+        _append_repetition(cmd, rep_interval_min=rep_interval_min, rep_duration=rep_duration)
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
+    if stop_at_rep_end and rep_interval_min is not None:
+        _set_repetition_stop_at_end(name, True)
 
 
-def create_hourly_task(alias: str, exe_path: str, every_hours: int, start_time: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_hourly_task(alias: str, exe_path: str, every_hours: int, start_time: str, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None, stop_at_rep_end: bool = False, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     """N時間おき（HOURLY）。start_time は HH:MM。"""
     if every_hours < 1 or every_hours > 168:
         raise ValueError("時間間隔は 1〜168 の範囲で指定してください")
@@ -360,17 +493,27 @@ def create_hourly_task(alias: str, exe_path: str, every_hours: int, start_time: 
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
-    _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    if utc:
+        cmd.append("/Z")
+    if rep_interval_min is None:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    else:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=None)
+        _append_repetition(cmd, rep_interval_min=rep_interval_min, rep_duration=rep_duration)
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
+    if stop_at_rep_end and rep_interval_min is not None:
+        _set_repetition_stop_at_end(name, True)
 
 
 _WEEKDAYS = {"MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"}
 
 
-def create_weekly_task(alias: str, exe_path: str, hhmm: str, days: List[str], weeks_interval: int = 1, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_weekly_task(alias: str, exe_path: str, hhmm: str, days: List[str], weeks_interval: int = 1, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None, stop_at_rep_end: bool = False, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     """毎週（WEEKLY）。days は ["MON", "TUE", ...]。"""
     _validate_hhmm(hhmm)
     if weeks_interval < 1 or weeks_interval > 52:
@@ -392,11 +535,21 @@ def create_weekly_task(alias: str, exe_path: str, hhmm: str, days: List[str], we
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
-    _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    if utc:
+        cmd.append("/Z")
+    if rep_interval_min is None:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    else:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=None)
+        _append_repetition(cmd, rep_interval_min=rep_interval_min, rep_duration=rep_duration)
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
+    if stop_at_rep_end and rep_interval_min is not None:
+        _set_repetition_stop_at_end(name, True)
 
 
 _MONTHS = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"}
@@ -406,7 +559,7 @@ _MONTH_NUM_TO_ABBR = {
 }
 
 
-def create_monthly_task(alias: str, exe_path: str, hhmm: str, days: List[str], months: Optional[List[str]] = None, months_interval: int = 1, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, elevated: bool = False, task_name: Optional[str] = None) -> None:
+def create_monthly_task(alias: str, exe_path: str, hhmm: str, days: List[str], months: Optional[List[str]] = None, months_interval: int = 1, *, sd: Optional[str] = None, ed: Optional[str] = None, et: Optional[str] = None, du: Optional[str] = None, rep_interval_min: Optional[int] = None, rep_duration: Optional[str] = None, stop_at_rep_end: bool = False, random_delay_minutes: Optional[int] = None, utc: bool = False, elevated: bool = False, task_name: Optional[str] = None) -> None:
     """毎月（MONTHLY）。
     - days: ["1","15","LAST"] のような日付指定。
     - months: ["JAN","FEB",...] または ["1","3","12"]（数値） 省略可。
@@ -463,13 +616,23 @@ def create_monthly_task(alias: str, exe_path: str, hhmm: str, days: List[str], m
         "/RL", ("HIGHEST" if elevated else "LIMITED"),
         "/F",
     ]
+    if utc:
+        cmd.append("/Z")
     if mstr:
         cmd.extend(["/M", mstr])
-    _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    if rep_interval_min is None:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=du)
+    else:
+        _append_schedule_window(cmd, sd=sd, ed=ed, et=et, du=None)
+        _append_repetition(cmd, rep_interval_min=rep_interval_min, rep_duration=rep_duration)
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
     _ensure_author(name)
+    if random_delay_minutes:
+        _set_calendar_random_delay_minutes(name, int(random_delay_minutes))
+    if stop_at_rep_end and rep_interval_min is not None:
+        _set_repetition_stop_at_end(name, True)
 
 
 def create_onidle_task(alias: str, exe_path: str, idle_minutes: int = 10, *, elevated: bool = False, task_name: Optional[str] = None) -> None:
@@ -523,3 +686,253 @@ def change_task_enabled(name: str, enabled: bool) -> None:
     cp = _run(cmd)
     if cp.returncode != 0:
         raise RuntimeError(cp.stderr or cp.stdout)
+
+
+def _set_trigger_delay_minutes(task_name: str, minutes: int, *, kind: str) -> None:
+    """Set <Delay> for Logon/Boot triggers by patching task XML. best-effort."""
+    try:
+        cp = _run(["schtasks", "/Query", "/TN", task_name, "/XML"])
+        if cp.returncode != 0 or not cp.stdout:
+            return
+        xml = cp.stdout
+        trig = "LogonTrigger" if kind.upper() == "LOGON" else "BootTrigger"
+        pat = re.compile(fr"(<{trig}[^>]*>)(.*?)(</{trig}>)", flags=re.S)
+        m = pat.search(xml)
+        if not m:
+            return
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        # Replace or insert <Delay>PT{M}M
+        if re.search(r"<Delay>.*?</Delay>", body, flags=re.S):
+            body2 = re.sub(r"<Delay>.*?</Delay>", f"<Delay>PT{minutes}M</Delay>", body)
+        else:
+            # Insert before closing tag; try after Enabled if exists
+            if "</Enabled>" in body:
+                body2 = body.replace("</Enabled>", "</Enabled><Delay>PT" + str(minutes) + "M</Delay>")
+            else:
+                body2 = body + f"<Delay>PT{minutes}M</Delay>"
+        new_xml = xml[:m.start()] + head + body2 + tail + xml[m.end():]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml", mode="w", encoding="utf-8") as f:
+            f.write(new_xml)
+            tmp = f.name
+        try:
+            _run(["schtasks", "/Create", "/TN", task_name, "/XML", tmp, "/F"])
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    except Exception:
+        # best-effort
+        pass
+
+
+def get_task_details(task_name: str) -> Dict[str, Optional[object]]:
+    """Return best-effort parsed details of a task from its XML.
+    Keys: Kind, StartTime, EveryMinutes, EveryHours, Days, WeeksInterval,
+          Months, MonthsInterval, OnceDate, StartDate, EndDate,
+          Enabled, Command, Arguments.
+    Values may be None if not applicable.
+    """
+    try:
+        cp = _run(["schtasks", "/Query", "/TN", task_name, "/XML"])
+        if cp.returncode != 0 or not cp.stdout:
+            return {}
+        xml = cp.stdout
+        out: Dict[str, Optional[object]] = {
+            'Kind': None,
+            'StartTime': None,
+            'EveryMinutes': None,
+            'EveryHours': None,
+            'Days': None,
+            'WeeksInterval': None,
+            'Months': None,
+            'MonthsInterval': None,
+            'OnceDate': None,
+            'StartDate': None,
+            'EndDate': None,
+            'Enabled': None,
+            'Command': None,
+            'Arguments': None,
+            'IdleMinutes': None,
+            'RepeatIntervalMinutes': None,
+            'RepeatDuration': None,
+            'RandomDelayMinutes': None,
+            'StopAtDurationEnd': None,
+            'Utc': None,
+        }
+
+        def _get(tag: str) -> Optional[str]:
+            m = re.search(fr"<{tag}>(.*?)</{tag}>", xml, flags=re.S)
+            return m.group(1).strip() if m else None
+
+        # Enabled
+        en = _get('Enabled')
+        if en is not None:
+            out['Enabled'] = en.lower() == 'true'
+
+        # Command/Arguments
+        out['Command'] = _get('Command')
+        out['Arguments'] = _get('Arguments')
+
+        # Boundaries
+        sb = _get('StartBoundary')
+        eb = _get('EndBoundary')
+        def _ymd(s: str) -> str:
+            try:
+                # 2025-08-27T14:30:00 -> 2025/08/27
+                d = s.split('T', 1)[0]
+                y, m, d2 = d.split('-')
+                return f"{y}/{m}/{d2}"
+            except Exception:
+                return s
+        def _hm(s: str) -> str:
+            try:
+                t = s.split('T', 1)[1]
+                hh, mm, *_ = t.split(':')
+                return f"{hh}:{mm}"
+            except Exception:
+                return ''
+        if sb:
+            out['StartDate'] = _ymd(sb)
+            out['StartTime'] = _hm(sb)
+            # crude UTC detection
+            if sb.endswith('Z'):
+                out['Utc'] = True
+        if eb:
+            out['EndDate'] = _ymd(eb)
+
+        # Quick kind checks
+        if re.search(r"<LogonTrigger>", xml):
+            out['Kind'] = 'ONLOGON'
+            return out
+        if re.search(r"<BootTrigger>", xml):
+            out['Kind'] = 'ONSTART'
+            return out
+        if re.search(r"<IdleTrigger>", xml):
+            out['Kind'] = 'ONIDLE'
+            return out
+
+    # Repetition
+        m_rep = re.search(r"<Repetition>.*?<Interval>PT(\d+)([MH]).*?(?:<Duration>P(?:T\d+H)?(?:T\d+M)?)?", xml, flags=re.S)
+        # Time/Calendar triggers
+        if re.search(r"<TimeTrigger>", xml) and not m_rep:
+            out['Kind'] = 'ONCE'
+            # For ONCE, date/time derived from StartBoundary
+            if sb:
+                out['OnceDate'] = _ymd(sb)
+            return out
+
+        # DAILY
+        if re.search(r"<ScheduleByDay>", xml):
+            out['Kind'] = 'DAILY'
+            # time from StartBoundary
+            return out
+
+        # WEEKLY
+        if re.search(r"<ScheduleByWeek>", xml):
+            out['Kind'] = 'WEEKLY'
+            # WeeksInterval
+            mw = re.search(r"<WeeksInterval>(\d+)</WeeksInterval>", xml)
+            if mw:
+                out['WeeksInterval'] = int(mw.group(1))
+            # DaysOfWeek
+            days_map = {
+                'Monday': 'MON', 'Tuesday': 'TUE', 'Wednesday': 'WED',
+                'Thursday': 'THU', 'Friday': 'FRI', 'Saturday': 'SAT', 'Sunday': 'SUN'
+            }
+            days: List[str] = []
+            md = re.search(r"<DaysOfWeek>(.*?)</DaysOfWeek>", xml, flags=re.S)
+            if md:
+                block = md.group(1)
+                for k, v in days_map.items():
+                    if re.search(fr"<{k}\s*/>", block):
+                        days.append(v)
+            out['Days'] = days or None
+            return out
+
+        # MONTHLY
+        if re.search(r"<ScheduleByMonth", xml):
+            out['Kind'] = 'MONTHLY'
+            # MonthsInterval (may appear as <MonthsInterval>)
+            mi = re.search(r"<MonthsInterval>(\d+)</MonthsInterval>", xml)
+            if mi:
+                out['MonthsInterval'] = int(mi.group(1))
+            # Months
+            months_map = {
+                'January': 'JAN', 'February': 'FEB', 'March': 'MAR', 'April': 'APR', 'May': 'MAY', 'June': 'JUN',
+                'July': 'JUL', 'August': 'AUG', 'September': 'SEP', 'October': 'OCT', 'November': 'NOV', 'December': 'DEC'
+            }
+            mm = re.search(r"<Months>(.*?)</Months>", xml, flags=re.S)
+            months: List[str] = []
+            if mm:
+                block = mm.group(1)
+                for k, v in months_map.items():
+                    if re.search(fr"<{k}\s*/>", block):
+                        months.append(v)
+            out['Months'] = months or None
+            # Days
+            days: List[str] = []
+            dm = re.search(r"<DaysOfMonth>(.*?)</DaysOfMonth>", xml, flags=re.S)
+            if dm:
+                block = dm.group(1)
+                for m in re.finditer(r"<Day>(\d+)</Day>", block):
+                    days.append(m.group(1))
+                if re.search(r"<LastDayOfMonth\s*/>", block):
+                    days.append('LAST')
+            out['Days'] = days or None
+            return out
+
+        # Repetition-based
+        if m_rep:
+            val = int(m_rep.group(1))
+            unit = m_rep.group(2)
+            # Interval
+            interval_min = val if unit == 'M' else val * 60
+            out['RepeatIntervalMinutes'] = interval_min
+            # Duration（任意）: ISO8601 PT...H...M の簡易抽出
+            dur_h = 0
+            dur_m = 0
+            m_dh = re.search(r"<Duration>P(?:T(\d+)H)?(?:T(\d+)M)?", xml)
+            if m_dh:
+                if m_dh.group(1):
+                    dur_h = int(m_dh.group(1))
+                if m_dh.group(2):
+                    dur_m = int(m_dh.group(2))
+                out['RepeatDuration'] = f"{dur_h}:{dur_m:02d}"
+            # StopAtDurationEnd
+            mse = re.search(r"<Repetition>.*?<StopAtDurationEnd>(true|false)</StopAtDurationEnd>.*?</Repetition>", xml, flags=re.S|re.I)
+            if mse:
+                out['StopAtDurationEnd'] = (mse.group(1).lower() == 'true')
+            # MINUTE/HOURLYの同定（StartBoundaryの有無とは無関係に）
+            if unit == 'M':
+                out['Kind'] = 'MINUTE'
+                out['EveryMinutes'] = val
+            elif unit == 'H':
+                out['Kind'] = 'HOURLY'
+                out['EveryHours'] = val
+            # 他の情報も残して返す
+            return out
+
+        # Idle settings
+        mi = re.search(r"<IdleSettings>.*?<Duration>PT(\d+)M</Duration>.*?</IdleSettings>", xml, flags=re.S)
+        if mi:
+            out['IdleMinutes'] = int(mi.group(1))
+            if out['Kind'] is None:
+                out['Kind'] = 'ONIDLE'
+
+        # RandomDelay for calendar trigger
+        mr = re.search(r"<CalendarTrigger[^>]*>.*?<RandomDelay>PT(\d+)M</RandomDelay>.*?</CalendarTrigger>", xml, flags=re.S)
+        if not mr:
+            mr = re.search(r"<TimeTrigger[^>]*>.*?<RandomDelay>PT(\d+)M</RandomDelay>.*?</TimeTrigger>", xml, flags=re.S)
+        if mr:
+            try:
+                out['RandomDelayMinutes'] = int(mr.group(1))
+            except Exception:
+                pass
+
+        # Fallback: if we have a StartTime but no kind
+        if out['StartTime']:
+            out['Kind'] = 'DAILY'
+        return out
+    except Exception:
+        return {}
